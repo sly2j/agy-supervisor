@@ -1,0 +1,14 @@
+{
+  "name": "agy-supervisor",
+  "displayName": "Supervisor for Antigravity",
+  "version": "1.0",
+  "description": "Multi-agent supervisor orchestration pack for Antigravity: hierarchical supervisor, domain leads, workers, independent critics, git worktree isolation, and persistent .supervisor/ project memory.",
+  "logo": "assets/logo.svg",
+  "author": "sjoosten",
+  "repository": "https://github.com/sjoosten/agy-supervisor",
+  "suggestedPrompts": [
+    "Pick up where the project left off using the pick-up skill and inspect .supervisor/roadmap.md.",
+    "Plan and implement a feature cleanly using planner, executor, and critic verification.",
+    "Close out this session cleanly, update .supervisor/ memory via curator, and verify git status."
+  ]
+}

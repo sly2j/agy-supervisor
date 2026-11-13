@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""Configure and invoke optional cross-family external critics (Claude / Codex)."""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+VALID_BACKENDS = ("claude", "codex")
+VALID_DOMAINS = ("research", "plan", "code", "prose")
+VALID_EFFORTS = ("low", "medium", "high", "max")
+DEFAULT_TIMEOUT_SEC = 240
+
+
+def default_config_path() -> Path:
+    env_path = os.environ.get("AGY_SUPERVISOR_CONFIG", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    # scripts/ -> supervisor-config/ -> skills/ -> <plugin_root>
+    return Path(__file__).resolve().parents[3] / "supervisor-config.json"
+
+
+def empty_config() -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "enabled": False,
+        "backend": None,
+        "model": None,
+        "effort": None,
+        "domains": {},
+    }
+
+
+def load_config(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        return empty_config()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid config at {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"Config at {path} must be a JSON object")
+    cfg = empty_config()
+    cfg.update(raw)
+    if not isinstance(cfg.get("domains"), dict):
+        cfg["domains"] = {}
+    return cfg
+
+
+def save_config(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2, sort_keys=False) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=".supervisor-config-", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp_name, str(path))
+    except Exception:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+        raise
+
+
+def find_binary(name: str) -> Optional[str]:
+    found = shutil.which(name)
+    if found:
+        return found
+    candidate = Path.home() / ".local" / "bin" / name
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return None
+
+
+def check_auth(backend: str, binary: str, timeout: int = 8) -> Tuple[bool, str]:
+    cmd = [binary, "auth", "status", "--json"] if backend == "claude" else [binary, "login", "status"]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"{backend} auth check failed: {exc}"
+
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        detail = err or out or f"exit {proc.returncode}"
+        login_hint = "claude auth login" if backend == "claude" else "codex login"
+        return False, f"{backend} not authenticated ({detail}); run `{login_hint}`"
+
+    if backend == "claude" and out:
+        try:
+            parsed = json.loads(out)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and parsed.get("loggedIn") is False:
+            return False, "claude not logged in; run `claude auth login`"
+
+    return True, out or "authenticated"
+
+
+def parse_domain_overrides(specs: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+    overrides: Dict[str, Dict[str, Optional[str]]] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError(f"Invalid --domain '{spec}'; expected <domain>=<backend>[:<model>]")
+        domain, rest = spec.split("=", 1)
+        domain = domain.strip()
+        if domain not in VALID_DOMAINS:
+            raise ValueError(
+                f"Unknown domain '{domain}'; expected one of {', '.join(VALID_DOMAINS)}"
+            )
+        rest = rest.strip()
+        if rest in ("off", "none"):
+            overrides[domain] = {"backend": "off", "model": None}
+            continue
+        if ":" in rest:
+            backend, model = rest.split(":", 1)
+            backend = backend.strip()
+            model_val: Optional[str] = model.strip() or None
+        else:
+            backend = rest
+            model_val = None
+        if backend not in VALID_BACKENDS:
+            raise ValueError(
+                f"Unsupported backend '{backend}' for domain '{domain}'; "
+                f"expected {', '.join(VALID_BACKENDS)} or off"
+            )
+        overrides[domain] = {"backend": backend, "model": model_val}
+    return overrides
+
+
+def resolve_target(
+    cfg: Dict[str, Any], domain: Optional[str]
+) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
+    if not cfg.get("enabled"):
+        return None
+    backend = cfg.get("backend")
+    model = cfg.get("model")
+    effort = cfg.get("effort")
+    domains = cfg.get("domains") or {}
+    if domain and domain in domains:
+        entry = domains[domain]
+        if isinstance(entry, dict):
+            ov_backend = entry.get("backend")
+            if ov_backend in ("off", "none") or ov_backend is False:
+                return None
+            if ov_backend:
+                backend = ov_backend
+            if "model" in entry:
+                model = entry["model"]
+    if backend not in VALID_BACKENDS:
+        return None
+    return str(backend), (str(model) if model else None), (str(effort) if effort else None)
+
+
+def validate_block(text: str) -> Tuple[bool, str]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False, "empty critic output"
+    verdict_match = re.search(
+        r"^##\s+Verdict\b(.*)$", stripped, flags=re.MULTILINE | re.IGNORECASE | re.DOTALL
+    )
+    if not verdict_match:
+        return False, "missing '## Verdict' section"
+    after_heading = verdict_match.group(1)
+    next_heading = re.search(r"^##\s+\S", after_heading, flags=re.MULTILINE)
+    verdict_body = after_heading[: next_heading.start()] if next_heading else after_heading
+    has_approve = bool(re.search(r"\bAPPROVE\b", verdict_body))
+    has_changes = bool(re.search(r"\bREQUEST\s+CHANGES\b", verdict_body))
+    if not (has_approve or has_changes):
+        return False, "verdict section missing APPROVE or REQUEST CHANGES"
+    if has_approve and has_changes:
+        return False, "ambiguous verdict containing both APPROVE and REQUEST CHANGES"
+    if not re.search(r"^##\s+Findings\b", stripped, flags=re.MULTILINE | re.IGNORECASE):
+        return False, "missing '## Findings' section"
+    return True, "ok"
+
+
+def build_review_prompt(domain: str, prompt_text: str, diff_text: Optional[str]) -> str:
+    parts = [
+        f"You are an independent cross-family adversarial {domain} critic.",
+        "Do NOT modify files or perform writes; review strictly in read-only mode.",
+        "Identify bugs, missing edge cases, unverified claims, security/safety flaws, "
+        "or requirement gaps.",
+        "",
+        "Format your response in Markdown with these required headings:",
+        "## Verdict",
+        "State exactly `APPROVE` or `REQUEST CHANGES` with a one-sentence rationale.",
+        "## Findings",
+        "Bullet list of concrete issues with file paths, lines, or evidence (`None.` if clean).",
+        "## Verification",
+        "Note checks inspected, coverage gaps, or tests that must still pass.",
+        "",
+        "--- REVIEW PACKET ---",
+        prompt_text.strip(),
+    ]
+    if diff_text is not None and diff_text.strip():
+        parts.extend(["", "--- DIFF ---", "```diff", diff_text.rstrip(), "```"])
+    return "\n".join(parts) + "\n"
+
+
+def invoke_backend(
+    backend: str,
+    binary: str,
+    prompt: str,
+    model: Optional[str],
+    effort: Optional[str],
+    timeout: int,
+) -> Tuple[int, str, str]:
+    if backend == "claude":
+        cmd = [binary, "-p", "--output-format", "text"]
+        if model:
+            cmd.extend(["--model", model])
+        if effort:
+            cmd.extend(["--effort", effort])
+    elif backend == "codex":
+        cmd = [binary, "exec", "--sandbox", "read-only"]
+        if model:
+            cmd.extend(["-m", model])
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    proc = subprocess.run(
+        cmd,
+        input=prompt,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def cmd_status(cfg_path: Path, as_json: bool) -> int:
+    try:
+        cfg = load_config(cfg_path)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    backends: Dict[str, Any] = {}
+    for name in VALID_BACKENDS:
+        binary = find_binary(name)
+        auth_ok: Optional[bool] = None
+        auth_msg = "binary not installed"
+        if binary:
+            auth_ok, auth_msg = check_auth(name, binary)
+        backends[name] = {
+            "binary": binary,
+            "authenticated": auth_ok,
+            "auth_detail": auth_msg,
+        }
+
+    report = {
+        "config_path": str(cfg_path),
+        "enabled": bool(cfg.get("enabled")),
+        "backend": cfg.get("backend"),
+        "model": cfg.get("model"),
+        "effort": cfg.get("effort"),
+        "domains": cfg.get("domains") or {},
+        "backends": backends,
+    }
+    if as_json:
+        print(json.dumps(report, indent=2))
+        return 0
+
+    state = "ENABLED" if report["enabled"] else "DISABLED (native critic active)"
+    print(f"External critic: {state}")
+    print(f"Config path:     {cfg_path}")
+    if report["enabled"]:
+        print(f"Default backend: {report['backend']} (model={report['model'] or 'default'}, "
+              f"effort={report['effort'] or 'default'})")
+        if report["domains"]:
+            print("Domain overrides:")
+            for dom, spec in sorted(report["domains"].items()):
+                print(f"  - {dom}: {spec}")
+    print("Available CLIs:")
+    for name in VALID_BACKENDS:
+        info = backends[name]
+        if not info["binary"]:
+            print(f"  - {name}: missing on PATH")
+        else:
+            tag = "ok" if info["authenticated"] else "unauthenticated"
+            print(f"  - {name}: {info['binary']} ({tag}: {info['auth_detail']})")
+    return 0
+
+
+def cmd_enable(args: argparse.Namespace, cfg_path: Path) -> int:
+    backend = args.backend
+    if backend not in VALID_BACKENDS:
+        print(f"error: backend must be one of {', '.join(VALID_BACKENDS)}", file=sys.stderr)
+        return 1
+    if args.effort and args.effort not in VALID_EFFORTS:
+        print(f"error: --effort must be one of {', '.join(VALID_EFFORTS)}", file=sys.stderr)
+        return 1
+
+    try:
+        overrides = parse_domain_overrides(args.domain or [])
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print(
+                "error: enabling an external critic sends prompts and code snippets outside "
+                "Antigravity; re-run interactively or pass --yes after user consent.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Consent check: enabling `{backend}` sends review prompts, specs, and diffs "
+            "outside Antigravity to the selected third-party CLI provider."
+        )
+        try:
+            reply = input("Proceed and enable external critic? [y/N]: ").strip().lower()
+        except EOFError:
+            reply = ""
+        if reply not in ("y", "yes"):
+            print("Aborted; external critic remains disabled.")
+            return 1
+
+    needed_backends = {backend}
+    for entry in overrides.values():
+        ov = entry.get("backend")
+        if ov in VALID_BACKENDS:
+            needed_backends.add(ov)
+
+    for needed in sorted(needed_backends):
+        binary = find_binary(needed)
+        if not binary:
+            print(f"error: '{needed}' CLI binary not found on PATH or ~/.local/bin", file=sys.stderr)
+            return 1
+        if not args.skip_auth_check:
+            ok, detail = check_auth(needed, binary)
+            if not ok:
+                print(f"error: {detail}", file=sys.stderr)
+                return 1
+
+    cfg = load_config(cfg_path) if cfg_path.is_file() else empty_config()
+    cfg["version"] = 1
+    cfg["enabled"] = True
+    cfg["backend"] = backend
+    cfg["model"] = args.model or None
+    cfg["effort"] = args.effort or None
+    if overrides:
+        merged_domains = dict(cfg.get("domains") or {})
+        merged_domains.update(overrides)
+        cfg["domains"] = merged_domains
+    cfg["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    save_config(cfg_path, cfg)
+
+    print(
+        f"Enabled external critic: backend={backend}, "
+        f"model={cfg['model'] or 'default'}, config={cfg_path}"
+    )
+    return 0
+
+
+def cmd_disable(cfg_path: Path) -> int:
+    cfg = load_config(cfg_path) if cfg_path.is_file() else empty_config()
+    cfg["enabled"] = False
+    cfg["updated_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    save_config(cfg_path, cfg)
+    print(f"Disabled external critic in {cfg_path}; native critic agent is active.")
+    return 0
+
+
+def cmd_review(args: argparse.Namespace, cfg_path: Path) -> int:
+    domain = args.domain or "code"
+    if domain not in VALID_DOMAINS:
+        print(f"error: invalid --domain '{domain}'", file=sys.stderr)
+        return 1
+
+    try:
+        cfg = load_config(cfg_path)
+    except ValueError as exc:
+        if args.probe:
+            print("NO_EXTERNAL_CRITIC")
+            return 2
+        print(f"EXTERNAL_CRITIC_FALLBACK: {exc}", file=sys.stderr)
+        return 3
+
+    target = resolve_target(cfg, domain)
+    if target is None:
+        print("NO_EXTERNAL_CRITIC")
+        return 2
+    backend, model, effort = target
+    binary = find_binary(backend)
+    if not binary:
+        if args.probe:
+            print("NO_EXTERNAL_CRITIC")
+            return 2
+        print(f"EXTERNAL_CRITIC_FALLBACK: binary '{backend}' not found", file=sys.stderr)
+        return 3
+
+    if args.probe:
+        print(f"{backend} {model or 'default'}")
+        return 0
+
+    if not args.prompt_file:
+        print("error: --prompt-file is required unless --probe is passed", file=sys.stderr)
+        return 1
+
+    prompt_path = Path(args.prompt_file)
+    if not prompt_path.is_file():
+        print(f"error: prompt file not found: {prompt_path}", file=sys.stderr)
+        return 1
+    prompt_text = prompt_path.read_text(encoding="utf-8")
+
+    diff_text: Optional[str] = None
+    if args.diff_file:
+        diff_path = Path(args.diff_file)
+        if not diff_path.is_file():
+            print(f"error: diff file not found: {diff_path}", file=sys.stderr)
+            return 1
+        diff_text = diff_path.read_text(encoding="utf-8")
+
+    composed = build_review_prompt(domain, prompt_text, diff_text)
+    try:
+        rc, stdout, stderr = invoke_backend(
+            backend=backend,
+            binary=binary,
+            prompt=composed,
+            model=model,
+            effort=effort,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"EXTERNAL_CRITIC_FALLBACK: {backend} timed out after {args.timeout}s",
+            file=sys.stderr,
+        )
+        return 3
+    except OSError as exc:
+        print(f"EXTERNAL_CRITIC_FALLBACK: failed to run {backend}: {exc}", file=sys.stderr)
+        return 3
+
+    if rc != 0:
+        detail = (stderr or stdout).strip().splitlines()[:1]
+        msg = detail[0] if detail else f"exit code {rc}"
+        print(f"EXTERNAL_CRITIC_FALLBACK: {backend} exited non-zero ({msg})", file=sys.stderr)
+        return 3
+
+    valid, reason = validate_block(stdout)
+    if not valid:
+        print(
+            f"EXTERNAL_CRITIC_FALLBACK: {backend} output failed validation ({reason})",
+            file=sys.stderr,
+        )
+        return 3
+
+    rendered = stdout.strip() + "\n"
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(rendered, encoding="utf-8")
+    sys.stdout.write(rendered)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config",
+        default=argparse.SUPPRESS,
+        help="Override supervisor-config.json path (default: plugin root or AGY_SUPERVISOR_CONFIG)",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="external-critic",
+        parents=[common],
+        description="Configure and run optional cross-family external critic reviews.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_status = sub.add_parser("status", parents=[common], help="Show external critic status")
+    p_status.add_argument("--json", action="store_true", help="Print status as JSON")
+
+    p_enable = sub.add_parser("enable", parents=[common], help="Enable Claude or Codex critic")
+    p_enable.add_argument("backend", choices=VALID_BACKENDS, help="External critic backend CLI")
+    p_enable.add_argument("model", nargs="?", default=None, help="Optional default model ID")
+    p_enable.add_argument("--effort", default=None, help="Effort level (low|medium|high|max)")
+    p_enable.add_argument(
+        "--domain",
+        action="append",
+        default=[],
+        help="Per-domain override <domain>=<backend>[:<model>] or <domain>=off",
+    )
+    p_enable.add_argument("--yes", action="store_true", help="Acknowledge cross-provider data flow")
+    p_enable.add_argument(
+        "--skip-auth-check", action="store_true", help="Skip live CLI auth probe during enable"
+    )
+
+    sub.add_parser("disable", parents=[common], help="Disable external critic and use native critic")
+
+    p_review = sub.add_parser("review", parents=[common], help="Probe or run external review")
+    p_review.add_argument(
+        "--domain", default="code", help="Review domain (research|plan|code|prose)"
+    )
+    p_review.add_argument(
+        "--probe", action="store_true", help="Check if an external critic is active for domain"
+    )
+    p_review.add_argument("--prompt-file", help="Path to self-contained review packet")
+    p_review.add_argument("--diff-file", help="Optional patch/diff file appended to prompt")
+    p_review.add_argument("--output", help="Optional path to write validated review markdown")
+    p_review.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT_SEC,
+        help=f"Subprocess timeout in seconds (default: {DEFAULT_TIMEOUT_SEC})",
+    )
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg_override = getattr(args, "config", None)
+    cfg_path = Path(cfg_override).expanduser() if cfg_override else default_config_path()
+
+    if args.command == "status":
+        return cmd_status(cfg_path, args.json)
+    if args.command == "enable":
+        return cmd_enable(args, cfg_path)
+    if args.command == "disable":
+        return cmd_disable(cfg_path)
+    if args.command == "review":
+        return cmd_review(args, cfg_path)
+    parser.error(f"Unhandled command: {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
