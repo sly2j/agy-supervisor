@@ -1,20 +1,54 @@
 ---
 name: email-extraction
-description: Distill email threads into structured decisions, action items, owners, deadlines, and open questions.
+description: Extract structured substance from an email thread - participants, ask/response chain, topic-grouped facts, actions with owners and timing, commitments, decisions, deadlines, unresolved questions - as a neutral intermediate artifact. Use when an email thread (pasted, .eml, exported mailbox text) must be digested before a reply, summary, task list, or status note is written, or when asked "what was asked / who owes what / what's still open" in a thread. Not for meeting transcripts (meeting-summary) or reference documents (document-extraction).
 ---
 
-# Email Thread Extraction
+# Email extraction
 
-Turn messy multi-reply email threads into crisp, chronological operational summaries without
-losing attributions or subtle caveats.
+Extract the recall-worthy substance of an email thread into a compact artifact that a downstream
+writer maps into its own format.
 
-## Output Structure
+## Scope
 
-1. **Thread Metadata**: Subject, participants (`Name / Role` if visible), date range.
-2. **Agreed Decisions**: explicit agreements with who confirmed and message date.
-3. **Action Items**: table with `Owner`, `Action`, `Due Date`, `Status` (mark unowned items
-   clearly as `UNASSIGNED`).
-4. **Open Questions & Blockers**: unresolved disagreements, waiting approvals, or conflicting
-   constraints quoted accurately.
-5. **Exact Commitments & Numbers**: preserve prices, dates, versions, URLs, and SLAs verbatim;
-   never infer deadlines not stated in the thread.
+- Extract content only. Do not choose templates, presentation style, file destinations, or final
+  prose. Do not edit files or insert notes.
+
+## Rules
+
+- Input is the raw thread plus optional vocabulary or domain context. Use the vocabulary to correct
+  plausible name, acronym, or term errors.
+- Prefer explicit statements over inferred intent; label uncertain or inferred items.
+- Deduplicate points repeated across quoted replies.
+- Identify who initiated, who responded, what was requested, and what remains unresolved.
+- Group by topic when the thread covers several subjects.
+- Include RAID items (risk, action, issue, assumption, dependency, decision) only when explicitly
+  present, each in exactly one category.
+- Omit pleasantries, signatures, disclaimers, and forwarding boilerplate.
+
+## Fields
+
+- **Thread metadata**: sender(s), recipient(s), date(s), subject, message count, date range.
+- **Thread direction**: summary of the ask chain and response chain.
+- **Topic groups**: ordered subjects, each with its own requests, decisions, actions, or issues.
+- **Notes**: 1-4 factual bullets per topic.
+- **Actions**: owner, task, timing, source topic.
+- **Commitments**: explicit promises with owner and timing.
+- **Decisions**: what was decided and by whom.
+- **Deadlines**: what is due and when.
+- **Unresolved questions**: unanswered or ambiguous questions.
+- **RAID items**: only when explicitly present.
+- **Ambiguities**: unclear references, names, dates, owners, conflicting statements.
+
+## Edge cases
+
+- Too sparse: say what is missing.
+- Messages that conflict: extract both positions and note the conflict.
+
+## Output
+
+A compact two-layer artifact, factual and free of presentation markup: thread level (metadata,
+direction summary, global ambiguities), then each topic group in order with the per-topic fields
+above.
+
+Before returning, check that every item traces to the thread or is labeled uncertain, that
+reply-chain duplicates were merged, and that topic notes are not a message-by-message log.

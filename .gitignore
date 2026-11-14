@@ -8,3 +8,5 @@ scratch/
 *.bak
 *.swp
 *~
+tools/audit/out/
+*.zip

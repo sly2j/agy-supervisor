@@ -1,34 +1,63 @@
 ---
 name: supervisor-config
-description: Manage optional cross-family external critic settings (Claude Code and OpenAI Codex) and consent.
+description: Switch the lead's critic between Claude, Codex, and native critic, or show which is active. Use when the user asks to configure external critic settings or check status.
+disable-model-invocation: true
 ---
 
-# Supervisor External Critic Configuration
+# Supervisor Config
 
-Supervisor supports an **optional, opt-in** cross-family external critic (`claude` or
-`codex` CLI) to review code, plans, research, and prose from an independent model family.
-External critics are **off by default** and fall back automatically to the native
-`critic` subagent if disabled, missing, or unauthenticated.
+Switch the external review backend of this install, configure per-domain models, or inspect status.
 
-## Tooling (`./scripts/external-critic`)
+Available actions:
+- `status`: show current external critic status and configured domain overrides.
+- `enable {claude,codex} [model]`: enable Claude Code or OpenAI Codex as external critic.
+- `disable`: disable external critic reviews and fall back to the native `critic` subagent.
 
-Resolve `external-critic` from `./scripts/external-critic` relative to this skill (or via
-`agy-supervisor critic ...` / `deploy critic ...`):
+## Consent Gate
 
-- **Inspect status**:
-  `./scripts/external-critic status`
-- **Enable with explicit consent** (prompts interactively unless `--yes` is given):
-  `./scripts/external-critic enable <claude|codex> [model] [--effort low|medium|high|max]`
-  Add per-domain overrides with repeatable `--domain <domain>=<backend>[:<model>]`
-  where `<domain>` is one of `research`, `plan`, `code`, `prose`.
-- **Disable external critic**:
-  `./scripts/external-critic disable`
-- **Probe / run review** (used by leads inside `lead-loop`):
-  `./scripts/external-critic review --domain code --probe`
-  `./scripts/external-critic review --domain code --prompt-file <p> [--diff-file <d>]`
+Enabling an external critic sends code diffs, review briefs, and repository excerpts to the
+external CLI provider (Anthropic or OpenAI). Never enable silently without explicit user
+confirmation. The CLI prompts interactively or requires `--yes` in non-interactive sessions:
 
-## Privacy & Consent Gate
+```
+External critic consent:
+- Reviews spend your provider quota / API credits.
+- Repository content, review brief, and diffs are sent to the selected external CLI.
+```
 
-Enabling an external critic sends prompts, specs, diffs, or file snippets to an external
-CLI provider outside Antigravity. Never enable silently without explaining this data flow
-and obtaining explicit user confirmation (interactive prompt or `--yes` after consent).
+## Tooling
+
+Commands run via `./scripts/external-critic`:
+
+```bash
+./scripts/external-critic status
+./scripts/external-critic enable claude [model] --yes
+./scripts/external-critic enable codex [model] --yes
+./scripts/external-critic disable
+```
+
+Subagents without `run_command` (such as `supervisor` main thread) dispatch `fixer` or `git-ops`
+with the exact command line to execute.
+
+## Configuration
+
+Settings persist in `supervisor-config.json` at the plugin root or `$AGY_SUPERVISOR_CONFIG`.
+Supported domains are `research`, `plan`, `code`, `prose`, and `agent-definition`.
+Per-domain overrides can be set with `--domain <domain>=<backend>[:<model>]` or in JSON:
+
+```json
+{
+  "critic": {
+    "enabled": true,
+    "backend": "claude",
+    "domains": {
+      "code": "codex",
+      "prose": "claude",
+      "plan": {"backend": "codex", "model": "o3", "effort": "high"}
+    }
+  }
+}
+```
+
+A domain value may be `"claude"`, `"codex"`, `"off"` (use native critic), or an object with
+`backend`, `model`, and/or `effort`.

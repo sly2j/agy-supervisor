@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import datetime
 import fcntl
 import hashlib
@@ -23,6 +24,7 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent
 DEFAULT_TAG = "supervisor"
 DEFAULT_PLUGIN_NAME = "agy-supervisor"
+DEFAULT_MODEL = "gemini-4-carbon-medium"
 MANIFEST_NAME = ".agy-supervisor-manifest.json"
 LAUNCHER_MARKER = "# managed by agy-supervisor deploy"
 MEMORY_MARKER = "<!-- agy-supervisor external memory -->"
@@ -171,6 +173,19 @@ def sha256_file(path: Path) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def backup_file(path: Path) -> Path:
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+    candidate = path.with_name(f"{path.name}.bak.{ts}")
+    if candidate.exists():
+        idx = 1
+        while path.with_name(f"{path.name}.bak.{ts}-{idx}").exists():
+            idx += 1
+        candidate = path.with_name(f"{path.name}.bak.{ts}-{idx}")
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(path), str(candidate))
+    return candidate
 
 
 def collect_files(root: Path) -> Dict[str, Path]:
@@ -339,7 +354,9 @@ def snapshot_state_bundle(prefix: Path, src_pack: Path, dry_run: bool = False) -
     )
 
 
-def render_launcher(prefix: Path, tag: str, target: Path) -> str:
+def render_launcher(
+    prefix: Path, tag: str, target: Path, default_model: str = DEFAULT_MODEL
+) -> str:
     deploy_saved = state_dir(prefix) / "deploy"
     py_exe = sys.executable or "/usr/bin/python3"
     q_py = shlex.quote(py_exe)
@@ -375,7 +392,21 @@ def render_launcher(prefix: Path, tag: str, target: Path) -> str:
         "  esac\n"
         "fi\n"
         'AGY_CMD="${AGY_BIN:-agy}"\n'
-        'exec "$AGY_CMD" --agent supervisor "$@"\n'
+        "has_model=0\n"
+        'for arg in "$@"; do\n'
+        '  case "$arg" in\n'
+        "    --model|-m|--model=*)\n"
+        "      has_model=1\n"
+        "      break\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        f'MODEL="${{AGY_SUPERVISOR_MODEL:-{default_model}}}"\n'
+        'if [ "$has_model" -eq 1 ]; then\n'
+        '  exec "$AGY_CMD" --agent supervisor "$@"\n'
+        "else\n"
+        '  exec "$AGY_CMD" --agent supervisor --model "$MODEL" "$@"\n'
+        "fi\n"
     )
 
 
@@ -389,14 +420,16 @@ def is_managed_launcher(path: Path) -> bool:
     return LAUNCHER_MARKER in head
 
 
-def write_launcher(prefix: Path, tag: str, target: Path, dry_run: bool = False) -> Path:
+def write_launcher(
+    prefix: Path, tag: str, target: Path, default_model: str = DEFAULT_MODEL, dry_run: bool = False
+) -> Path:
     path = launcher_path(prefix, tag)
     if path.exists() and not is_managed_launcher(path):
         raise DeployError(f"{path} exists and is not an agy-supervisor launcher; move it or pass --no-launcher")
     if dry_run:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = render_launcher(prefix, tag, target)
+    content = render_launcher(prefix, tag, target, default_model=default_model)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}-", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -519,6 +552,53 @@ def sync_critic_permission(target: Path, add: bool = True, dry_run: bool = False
     return f"removed scoped review permission rule from {settings_path}"
 
 
+def memory_grant(memory_root: Path) -> Tuple[str, str]:
+    dir_str = str(memory_root)
+    pattern = f"/{dir_str.lstrip('/')}"
+    return dir_str, f"Edit({pattern}/**)"
+
+
+def plan_memory_grant(
+    settings: Dict[str, Any], memory_root: Path
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, List[str]]]:
+    dir_str, rule_str = memory_grant(memory_root)
+    perms = settings.get("permissions")
+    if perms is not None and not isinstance(perms, dict):
+        raise DeployError("settings permissions is not an object")
+    perms_dict = dict(perms or {})
+
+    add_dirs = perms_dict.get("additionalDirectories")
+    if add_dirs is not None and not isinstance(add_dirs, list):
+        raise DeployError("settings permissions.additionalDirectories is not a list")
+    add_dirs_list = list(add_dirs or [])
+
+    allow = perms_dict.get("allow")
+    if allow is not None and not isinstance(allow, list):
+        raise DeployError("settings permissions.allow is not a list")
+    allow_list = list(allow or [])
+
+    added: Dict[str, List[str]] = {"additionalDirectories": [], "allow": []}
+
+    if dir_str not in add_dirs_list:
+        add_dirs_list.append(dir_str)
+        added["additionalDirectories"].append(dir_str)
+
+    if rule_str not in allow_list:
+        allow_list.append(rule_str)
+        added["allow"].append(rule_str)
+
+    if not added["additionalDirectories"] and not added["allow"]:
+        return None, added
+
+    new_perms = dict(perms_dict)
+    new_perms["additionalDirectories"] = add_dirs_list
+    new_perms["allow"] = allow_list
+
+    new_settings = dict(settings)
+    new_settings["permissions"] = new_perms
+    return new_settings, added
+
+
 def prune_empty_dirs(root: Path, rel_paths: List[str], dry_run: bool = False) -> None:
     if dry_run:
         return
@@ -536,11 +616,56 @@ def prune_empty_dirs(root: Path, rel_paths: List[str], dry_run: bool = False) ->
                 pass
 
 
+@contextlib.contextmanager
+def resolve_source(source: Optional[str]) -> Iterator[Tuple[Path, str, Path]]:
+    """Yields (src_pack_dir, version, source_root)."""
+    if not source:
+        yield source_pack_dir(), read_version(), REPO_ROOT
+        return
+    is_remote = source.startswith(("https://", "http://", "git@", "ssh://")) or (
+        "://" in source and not source.startswith("file://")
+    )
+    if is_remote:
+        with tempfile.TemporaryDirectory(prefix="agy-supervisor-clone-") as clone_tmp:
+            try:
+                proc = subprocess.run(
+                    ["git", "clone", "--depth", "1", source, clone_tmp],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    check=False,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise DeployError(f"failed to run git clone for {source}: {exc}") from exc
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()
+                raise DeployError(f"git clone failed for {source}:\n{detail}")
+            src_root = Path(clone_tmp)
+            src_pack = src_root / "pack" if (src_root / "pack" / "plugin.json").is_file() else src_root
+            if not (src_pack / "plugin.json").is_file():
+                raise DeployError(f"remote source {source} missing plugin.json")
+            ver_file = src_root / "VERSION"
+            version = ver_file.read_text(encoding="utf-8").strip() if ver_file.is_file() else "0.0"
+            yield src_pack, version, src_root
+    else:
+        clean_source = source[7:] if source.startswith("file://") else source
+        src_root = Path(clean_source).expanduser().resolve()
+        if not src_root.exists():
+            raise DeployError(f"source directory does not exist: {source}")
+        if (src_root / "pack" / "plugin.json").is_file():
+            src_pack = src_root / "pack"
+        elif (src_root / "plugin.json").is_file():
+            src_pack = src_root
+        else:
+            raise DeployError(f"source {source} has no pack/plugin.json or plugin.json")
+        ver_file = src_root / "VERSION"
+        version = ver_file.read_text(encoding="utf-8").strip() if ver_file.is_file() else read_version()
+        yield src_pack, version, src_root
+
+
 def install_or_update(args: argparse.Namespace, is_update: bool) -> int:
     target, mode, tag, dir_name = resolve_target(args)
     prefix = resolve_prefix(args)
-    src_pack = source_pack_dir()
-    version = read_version()
     dry_run = bool(args.dry_run)
     force = bool(args.force)
 
@@ -548,143 +673,213 @@ def install_or_update(args: argparse.Namespace, is_update: bool) -> int:
     if is_update and existing_manifest is None:
         raise DeployError(f"no install manifest found at {target}; run `install` first")
 
-    with tempfile.TemporaryDirectory(prefix="agy-supervisor-stage-") as tmp:
-        stage_dir = Path(tmp) / dir_name
-        staged_files = stage_pack(src_pack, stage_dir, tag, dir_name)
-        val_state, val_msg = validate_pack_with_agy(stage_dir, skip=bool(args.skip_agy_validate))
-
-        # Check conflicts with unmanaged files or modified managed files before mutating.
-        unmanaged_conflicts: List[str] = []
-        modified_files: List[str] = []
-        if existing_manifest is None:
-            for rel in staged_files:
-                dst = target / rel
-                if dst.exists() or dst.is_symlink():
-                    unmanaged_conflicts.append(rel)
+    cli_model = getattr(args, "default_model", None)
+    if is_update:
+        if cli_model:
+            default_model = cli_model
+        elif existing_manifest and existing_manifest.get("default_model"):
+            default_model = existing_manifest["default_model"]
         else:
-            for rel, state in file_states(target, existing_manifest, staged_files):
-                if state == "conflict":
-                    unmanaged_conflicts.append(rel)
-                elif state == "modified":
-                    modified_files.append(rel)
+            default_model = DEFAULT_MODEL
+    else:
+        default_model = cli_model or DEFAULT_MODEL
 
-        if unmanaged_conflicts and not force:
-            sample = ", ".join(unmanaged_conflicts[:5])
-            raise DeployError(
-                f"{len(unmanaged_conflicts)} unmanaged file conflict(s) in {target} ({sample}); "
-                "re-run with --force to overwrite"
-            )
+    source_arg = getattr(args, "source", None)
+    with resolve_source(source_arg) as (src_pack, version, src_root):
+        with tempfile.TemporaryDirectory(prefix="agy-supervisor-stage-") as tmp:
+            stage_dir = Path(tmp) / dir_name
+            staged_files = stage_pack(src_pack, stage_dir, tag, dir_name)
+            val_state, val_msg = validate_pack_with_agy(stage_dir, skip=bool(args.skip_agy_validate))
 
-        skip_rels = set()
-        if is_update and modified_files and not force:
-            skip_rels = set(modified_files)
-            print(
-                f"Preserving {len(modified_files)} locally modified file(s); pass --force to overwrite."
-            )
-        elif not is_update and modified_files and not force:
-            sample = ", ".join(modified_files[:5])
-            raise DeployError(
-                f"{len(modified_files)} locally modified managed file(s) in {target} ({sample}); "
-                "re-run with --force or use `update`"
-            )
+            # Check conflicts with unmanaged files or modified managed files before mutating.
+            unmanaged_conflicts: List[str] = []
+            modified_files: List[str] = []
+            if existing_manifest is None:
+                for rel in staged_files:
+                    dst = target / rel
+                    if dst.exists() or dst.is_symlink():
+                        unmanaged_conflicts.append(rel)
+            else:
+                for rel, state in file_states(target, existing_manifest, staged_files):
+                    if state == "conflict":
+                        unmanaged_conflicts.append(rel)
+                    elif state == "modified":
+                        modified_files.append(rel)
 
-        with file_lock(target / ".deploy.lock" if target.exists() else Path(tmp) / ".lock", dry_run=dry_run):
-            if not dry_run:
-                target.mkdir(parents=True, exist_ok=True)
-
-            manifest_files: Dict[str, Dict[str, Any]] = {}
-            old_files = (existing_manifest or {}).get("files") or {}
-            obsolete_rels = sorted(set(old_files.keys()) - set(staged_files.keys()))
-
-            copied = 0
-            for rel, src_path in sorted(staged_files.items()):
-                dst = target / rel
-                if rel in skip_rels and rel in old_files:
-                    manifest_files[rel] = old_files[rel]
-                    continue
-                sha = sha256_file(src_path)
-                manifest_files[rel] = {
-                    "sha256": sha,
-                    "mode": oct(src_path.stat().st_mode & 0o777),
-                }
-                if not dry_run:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(str(src_path), str(dst))
-                    if os.access(str(src_path), os.X_OK):
-                        os.chmod(str(dst), 0o755)
-                copied += 1
-
-            removed_obsolete: List[str] = []
-            for rel in obsolete_rels:
-                dst = target / rel
-                if dst.is_file():
-                    if not force and sha256_file(dst) != old_files[rel].get("sha256"):
-                        manifest_files[rel] = old_files[rel]
-                        print(f"Preserving modified obsolete file: {rel}")
-                        continue
-                    if not dry_run:
-                        dst.unlink()
-                    removed_obsolete.append(rel)
-            prune_empty_dirs(target, removed_obsolete, dry_run=dry_run)
-
-            launcher: Optional[Path] = None
-            write_launch = mode == "global" and not getattr(args, "no_launcher", False)
-            if is_update and existing_manifest is not None:
-                prev_launcher = existing_manifest.get("launcher")
-                write_launch = mode == "global" and bool(prev_launcher)
-            if write_launch:
-                launcher = write_launcher(prefix, tag, target, dry_run=dry_run)
-
-            cfg_notes: List[str] = []
-            if mode == "global":
-                cfg_notes = update_agy_config(
-                    dir_name,
-                    disable_siblings=bool(getattr(args, "disable_siblings", False)),
-                    dry_run=dry_run,
+            if unmanaged_conflicts and not force:
+                sample = ", ".join(unmanaged_conflicts[:5])
+                raise DeployError(
+                    f"{len(unmanaged_conflicts)} unmanaged file conflict(s) in {target} ({sample}); "
+                    "re-run with --force to overwrite"
                 )
 
-            perm_msg = sync_critic_permission(target, add=True, dry_run=dry_run)
+            skip_rels = set()
+            if is_update and modified_files and not force:
+                skip_rels = set(modified_files)
+                print(
+                    f"Preserving {len(modified_files)} locally modified file(s); pass --force to overwrite."
+                )
+            elif not is_update and modified_files and not force:
+                sample = ", ".join(modified_files[:5])
+                raise DeployError(
+                    f"{len(modified_files)} locally modified managed file(s) in {target} ({sample}); "
+                    "re-run with --force or use `update`"
+                )
 
-            manifest_data = {
-                "version": version,
-                "tag": tag,
-                "plugin_name": dir_name,
-                "mode": mode,
-                "target": str(target),
-                "launcher": str(launcher) if launcher else None,
-                "source_dir": str(REPO_ROOT),
-                "installed_at": utc_now(),
-                "files": manifest_files,
-            }
-            if not dry_run:
-                write_json_atomic(target / MANIFEST_NAME, manifest_data)
-                snapshot_state_bundle(prefix, src_pack, dry_run=dry_run)
+            with file_lock(target / ".deploy.lock" if target.exists() else Path(tmp) / ".lock", dry_run=dry_run):
+                if not dry_run:
+                    target.mkdir(parents=True, exist_ok=True)
 
-            register_install(
-                prefix,
-                target,
-                {
+                manifest_files: Dict[str, Dict[str, Any]] = {}
+                old_files = (existing_manifest or {}).get("files") or {}
+                obsolete_rels = sorted(set(old_files.keys()) - set(staged_files.keys()))
+
+                copied = 0
+                for rel, src_path in sorted(staged_files.items()):
+                    dst = target / rel
+                    if rel in skip_rels and rel in old_files:
+                        manifest_files[rel] = old_files[rel]
+                        continue
+                    if force and (rel in unmanaged_conflicts or rel in modified_files) and dst.exists():
+                        if not dry_run:
+                            bak = backup_file(dst)
+                            print(f"Backed up {dst} -> {bak}")
+                        else:
+                            print(f"[dry-run] Would backup {dst} before overwriting")
+                    sha = sha256_file(src_path)
+                    manifest_files[rel] = {
+                        "sha256": sha,
+                        "mode": oct(src_path.stat().st_mode & 0o777),
+                    }
+                    if not dry_run:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(str(src_path), str(dst))
+                        if os.access(str(src_path), os.X_OK):
+                            os.chmod(str(dst), 0o755)
+                    copied += 1
+
+                removed_obsolete: List[str] = []
+                for rel in obsolete_rels:
+                    dst = target / rel
+                    if dst.is_file():
+                        if not force and sha256_file(dst) != old_files[rel].get("sha256"):
+                            manifest_files[rel] = old_files[rel]
+                            print(f"Preserving modified obsolete file: {rel}")
+                            continue
+                        if force and sha256_file(dst) != old_files[rel].get("sha256"):
+                            if not dry_run:
+                                bak = backup_file(dst)
+                                print(f"Backed up {dst} -> {bak}")
+                        if not dry_run:
+                            dst.unlink()
+                        removed_obsolete.append(rel)
+                prune_empty_dirs(target, removed_obsolete, dry_run=dry_run)
+
+                launcher: Optional[Path] = None
+                write_launch = mode == "global" and not getattr(args, "no_launcher", False)
+                if is_update and existing_manifest is not None:
+                    prev_launcher = existing_manifest.get("launcher")
+                    write_launch = mode == "global" and bool(prev_launcher)
+                if write_launch:
+                    launcher = write_launcher(
+                        prefix, tag, target, default_model=default_model, dry_run=dry_run
+                    )
+
+                cfg_notes: List[str] = []
+                if mode == "global":
+                    cfg_notes = update_agy_config(
+                        dir_name,
+                        disable_siblings=bool(getattr(args, "disable_siblings", False)),
+                        dry_run=dry_run,
+                    )
+
+                perm_msg = sync_critic_permission(target, add=True, dry_run=dry_run)
+
+                # Check external memory grant
+                memory_candidates = []
+                if mode == "workspace" and getattr(args, "workspace", None):
+                    ws_path = Path(args.workspace).expanduser().resolve()
+                    memory_candidates.append(ws_path / ".supervisor")
+                memory_candidates.append(Path.cwd() / ".supervisor")
+                memory_candidates.append(REPO_ROOT / ".supervisor")
+
+                detected_external_mem: Optional[Path] = None
+                for sup_cand in memory_candidates:
+                    if sup_cand.is_symlink():
+                        try:
+                            target_link = Path(os.readlink(str(sup_cand)))
+                            resolved = (
+                                target_link
+                                if target_link.is_absolute()
+                                else (sup_cand.parent / target_link).resolve()
+                            )
+                            ext_dir = resolved.parent if resolved.name == ".supervisor" else resolved
+                            detected_external_mem = ext_dir
+                            break
+                        except OSError:
+                            pass
+
+                recorded_grant: Optional[Dict[str, List[str]]] = None
+                if detected_external_mem is not None:
+                    settings_path = agy_cli_dir() / "settings.json"
+                    settings = load_json_object(settings_path, "Antigravity CLI settings.json")
+                    new_settings, added = plan_memory_grant(settings, detected_external_mem)
+                    if new_settings is not None and not dry_run:
+                        write_json_atomic(settings_path, new_settings)
+                    dir_g, rule_g = memory_grant(detected_external_mem)
+                    recorded_grant = {
+                        "additionalDirectories": [dir_g],
+                        "allow": [rule_g],
+                    }
+                elif is_update and existing_manifest and existing_manifest.get("memory_grant"):
+                    recorded_grant = existing_manifest["memory_grant"]
+
+                manifest_data = {
                     "version": version,
                     "tag": tag,
                     "plugin_name": dir_name,
                     "mode": mode,
+                    "target": str(target),
+                    "default_model": default_model,
                     "launcher": str(launcher) if launcher else None,
-                    "updated_at": utc_now(),
-                },
-                dry_run=dry_run,
-            )
+                    "source_dir": str(src_root),
+                    "installed_at": utc_now(),
+                    "files": manifest_files,
+                }
+                if recorded_grant is not None:
+                    manifest_data["memory_grant"] = recorded_grant
 
-    action = "[dry-run] " if dry_run else ""
-    verb = "Updated" if is_update else "Installed"
-    print(f"{action}{verb} {dir_name} v{version} ({mode}) -> {target}")
-    print(f"  validation: {val_state} ({val_msg})")
-    print(f"  files:      {copied} managed file(s)")
-    if launcher:
-        print(f"  launcher:   {launcher}")
-    for note in cfg_notes:
-        print(f"  config:     {note}")
-    print(f"  critic:     {perm_msg}")
-    return 0
+                if not dry_run:
+                    write_json_atomic(target / MANIFEST_NAME, manifest_data)
+                    snapshot_state_bundle(prefix, src_pack, dry_run=dry_run)
+
+                register_install(
+                    prefix,
+                    target,
+                    {
+                        "version": version,
+                        "tag": tag,
+                        "plugin_name": dir_name,
+                        "mode": mode,
+                        "default_model": default_model,
+                        "launcher": str(launcher) if launcher else None,
+                        "updated_at": utc_now(),
+                    },
+                    dry_run=dry_run,
+                )
+
+        action = "[dry-run] " if dry_run else ""
+        verb = "Updated" if is_update else "Installed"
+        print(f"{action}{verb} {dir_name} v{version} ({mode}) -> {target}")
+        print(f"  validation: {val_state} ({val_msg})")
+        print(f"  files:      {copied} managed file(s)")
+        print(f"  model:      {default_model}")
+        if launcher:
+            print(f"  launcher:   {launcher}")
+        for note in cfg_notes:
+            print(f"  config:     {note}")
+        print(f"  critic:     {perm_msg}")
+        return 0
 
 
 def install_cmd(args: argparse.Namespace) -> int:
@@ -692,6 +887,46 @@ def install_cmd(args: argparse.Namespace) -> int:
 
 
 def update_cmd(args: argparse.Namespace) -> int:
+    if getattr(args, "all", False):
+        if (
+            getattr(args, "tag", None) is not None
+            or getattr(args, "target", None) is not None
+            or getattr(args, "workspace", None) is not None
+        ):
+            raise DeployError("cannot combine --all with --tag, --target, or --workspace")
+        prefix = resolve_prefix(args)
+        installs = load_registry(prefix)
+        if not installs:
+            print(f"No agy-supervisor installs registered under {prefix}.")
+            return 0
+        rc = 0
+        for target_str, entry in sorted(installs.items()):
+            target_path = Path(target_str)
+            if not target_path.exists():
+                print(f"Skipping {target_str}: target directory not found")
+                continue
+            entry_mode = entry.get("mode", "global")
+            entry_tag = entry.get("tag", DEFAULT_TAG)
+            sub_args = copy.copy(args)
+            sub_args.all = False
+            sub_args.tag = entry_tag
+            if entry_mode == "global":
+                sub_args.target = None
+                sub_args.workspace = None
+            elif entry_mode == "workspace":
+                sub_args.target = None
+                sub_args.workspace = str(target_path.parents[2])
+            else:
+                sub_args.target = str(target_path)
+                sub_args.workspace = None
+            try:
+                sub_rc = install_or_update(sub_args, is_update=True)
+                if sub_rc != 0:
+                    rc = sub_rc
+            except DeployError as exc:
+                eprint(f"error updating {target_str}: {exc}")
+                rc = 1
+        return rc
     return install_or_update(args, is_update=True)
 
 
@@ -740,6 +975,7 @@ def status_cmd(args: argparse.Namespace) -> int:
         "mode": mode,
         "tag": tag,
         "plugin_name": manifest.get("plugin_name", dir_name),
+        "default_model": manifest.get("default_model") or DEFAULT_MODEL,
         "files": counts,
         "launcher": str(lpath) if lpath else None,
         "launcher_ok": bool(lpath and is_managed_launcher(lpath)),
@@ -755,6 +991,7 @@ def status_cmd(args: argparse.Namespace) -> int:
     print(f"Plugin:    {info['plugin_name']} v{info['version']} ({mode})")
     print(f"Target:    {target}")
     print(f"Files:     {counts['clean']} clean, {counts['modified']} modified, {counts['missing']} missing")
+    print(f"Model:     {info['default_model']}")
     if lpath:
         print(f"Launcher:  {lpath} ({'present' if info['launcher_ok'] else 'missing'})")
     if mode == "global":
@@ -858,6 +1095,54 @@ def uninstall_cmd(args: argparse.Namespace) -> int:
     if mode == "global":
         remove_from_agy_config(dir_name, dry_run=dry_run)
     sync_critic_permission(target, add=False, dry_run=dry_run)
+
+    recorded_grant = manifest.get("memory_grant") or manifest.get("memory_grants")
+    if recorded_grant and not dry_run:
+        dirs_to_remove: List[str] = []
+        allows_to_remove: List[str] = []
+        if isinstance(recorded_grant, dict):
+            dirs_to_remove.extend(recorded_grant.get("additionalDirectories") or [])
+            allows_to_remove.extend(recorded_grant.get("allow") or [])
+        elif isinstance(recorded_grant, list):
+            for item in recorded_grant:
+                if isinstance(item, str):
+                    if item.startswith("Edit("):
+                        allows_to_remove.append(item)
+                    else:
+                        dirs_to_remove.append(item)
+        elif isinstance(recorded_grant, str):
+            d, a = memory_grant(Path(recorded_grant))
+            dirs_to_remove.append(d)
+            allows_to_remove.append(a)
+
+        if dirs_to_remove or allows_to_remove:
+            settings_path = agy_cli_dir() / "settings.json"
+            if settings_path.is_file():
+                settings = load_json_object(settings_path, "Antigravity CLI settings.json")
+                perms = settings.get("permissions")
+                if isinstance(perms, dict):
+                    new_perms = dict(perms)
+                    cur_dirs = new_perms.get("additionalDirectories")
+                    if isinstance(cur_dirs, list):
+                        filtered_dirs = [d for d in cur_dirs if d not in dirs_to_remove]
+                        if filtered_dirs:
+                            new_perms["additionalDirectories"] = filtered_dirs
+                        else:
+                            new_perms.pop("additionalDirectories", None)
+                    cur_allow = new_perms.get("allow")
+                    if isinstance(cur_allow, list):
+                        filtered_allow = [a for a in cur_allow if a not in allows_to_remove]
+                        if filtered_allow:
+                            new_perms["allow"] = filtered_allow
+                        else:
+                            new_perms.pop("allow", None)
+                    new_settings = dict(settings)
+                    if new_perms:
+                        new_settings["permissions"] = new_perms
+                    else:
+                        new_settings.pop("permissions", None)
+                    write_json_atomic(settings_path, new_settings)
+
     unregister_install(prefix, target, dry_run=dry_run)
 
     prefix_msg = "[dry-run] " if dry_run else ""
@@ -923,6 +1208,9 @@ def doctor_cmd(args: argparse.Namespace) -> int:
             add("FAIL", f"{len(missing)} managed files missing in {target}: {', '.join(missing[:5])}")
         if modified:
             add("WARN", f"{len(modified)} locally modified files in {target}: {', '.join(modified[:5])}")
+
+        dm = manifest.get("default_model") or DEFAULT_MODEL
+        add("PASS", f"default model: {dm}")
 
         if mode == "global":
             cfg = load_json_object(agy_config_dir() / "config.json", "config.json")
@@ -1238,6 +1526,11 @@ def memory_externalize_cmd(args: argparse.Namespace) -> int:
             if not dry_run:
                 os.symlink(str(ext), str(proj))
     memory_attach(main_top, external, template, dry_run=dry_run)
+    settings_path = agy_cli_dir() / "settings.json"
+    settings = load_json_object(settings_path, "Antigravity CLI settings.json")
+    new_settings, added = plan_memory_grant(settings, external)
+    if new_settings is not None and not dry_run:
+        write_json_atomic(settings_path, new_settings)
     print(f"{'[dry-run] ' if dry_run else ''}externalized: {external}")
     return 0
 
@@ -1245,6 +1538,7 @@ def memory_externalize_cmd(args: argparse.Namespace) -> int:
 def memory_link_cmd(args: argparse.Namespace) -> int:
     main_top, top, external, template = memory_prepare(args, "link")
     dry_run = bool(args.dry_run)
+    repair = bool(getattr(args, "repair", False)) or bool(getattr(args, "force", False))
     if not (external / ".supervisor").is_dir():
         raise DeployError(f"no external store at {external}; run `memory externalize` first")
     plan: List[Tuple[str, bool, bool]] = []
@@ -1255,7 +1549,17 @@ def memory_link_cmd(args: argparse.Namespace) -> int:
         if state == "real":
             raise DeployError(f"{proj} is a real path; run `memory externalize` instead")
         if state == "other":
-            raise DeployError(f"{proj} links elsewhere ({os.readlink(str(proj))}); remove link first")
+            if repair or (proj.is_symlink() and not proj.exists()):
+                if not dry_run:
+                    proj.unlink()
+                state = "absent"
+            else:
+                raise DeployError(f"{proj} links elsewhere ({os.readlink(str(proj))}); remove link first")
+        elif state == "expected" and proj.is_symlink() and not proj.exists():
+            if repair:
+                if not dry_run:
+                    proj.unlink()
+                state = "absent"
         plan.append((name, state == "absent", present))
     for name, absent, present in plan:
         if not absent:
@@ -1326,7 +1630,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_inst = sub.add_parser("install", help="Install the pack and agy-supervisor launcher")
     add_target_flags(p_inst)
-    p_inst.add_argument("--force", action="store_true", help="Overwrite conflicts or modified files")
+    p_inst.add_argument(
+        "--force",
+        "--overwrite-local",
+        dest="force",
+        action="store_true",
+        help="Overwrite conflicts or modified files",
+    )
+    p_inst.add_argument(
+        "--default-model",
+        default=DEFAULT_MODEL,
+        help=f"Default model id for launcher (default: {DEFAULT_MODEL})",
+    )
     p_inst.add_argument("--dry-run", action="store_true", help="Preview changes without writing")
     p_inst.add_argument("--skip-agy-validate", action="store_true", help="Skip agy plugin validate")
     p_inst.add_argument("--no-launcher", action="store_true", help="Do not create bin/agy-<tag>")
@@ -1338,7 +1653,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_upd = sub.add_parser("update", help="Update an existing install, keeping user edits")
     add_target_flags(p_upd)
-    p_upd.add_argument("--force", action="store_true", help="Overwrite locally modified files")
+    p_upd.add_argument(
+        "--force",
+        "--overwrite-local",
+        dest="force",
+        action="store_true",
+        help="Overwrite locally modified files",
+    )
+    p_upd.add_argument(
+        "--default-model",
+        default=None,
+        help="Default model id for launcher (preserves existing if not specified)",
+    )
+    p_upd.add_argument(
+        "--all",
+        action="store_true",
+        help="Update all registered supervisor installs",
+    )
+    p_upd.add_argument(
+        "--from",
+        dest="source",
+        default=None,
+        help="Update source: local repo directory or git URL",
+    )
     p_upd.add_argument("--dry-run", action="store_true", help="Preview update without writing")
     p_upd.add_argument("--skip-agy-validate", action="store_true", help="Skip agy plugin validate")
     p_upd.add_argument(
@@ -1385,6 +1722,17 @@ def build_parser() -> argparse.ArgumentParser:
         pm.add_argument("--name", default=None, help="Project directory name under store root")
         if verb_name in ("externalize", "link"):
             pm.add_argument("--dry-run", action="store_true", help="Preview changes without modifying")
+        if verb_name == "link":
+            pm.add_argument(
+                "--repair",
+                action="store_true",
+                help="Repair dangling or misplaced memory symlinks",
+            )
+            pm.add_argument(
+                "--force",
+                action="store_true",
+                help="Alias for --repair",
+            )
 
     return parser
 

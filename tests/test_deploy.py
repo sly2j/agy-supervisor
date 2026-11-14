@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -125,7 +126,7 @@ print("ARGS:" + json.dumps(sys.argv[1:]))
             [str(launcher), "-p", "hello"], capture_output=True, text=True, env=env, check=False
         )
         self.assertEqual(l_run.returncode, 0, l_run.stderr)
-        self.assertIn('["--agent", "supervisor", "-p", "hello"]', l_run.stdout)
+        self.assertIn('["--agent", "supervisor", "--model", "gemini-4-carbon-medium", "-p", "hello"]', l_run.stdout)
 
         doc = self.run_deploy("doctor", "--json", env=env)
         self.assertEqual(doc.returncode, 0, doc.stdout + doc.stderr)
@@ -182,6 +183,183 @@ print("ARGS:" + json.dumps(sys.argv[1:]))
         self.assertEqual(ws.returncode, 0, ws.stderr)
         ws_target = self.workspace / ".agents" / "plugins" / "agy-supervisor"
         self.assertTrue((ws_target / ".agy-supervisor-manifest.json").is_file())
+
+    def test_backup_created_on_force_overwrite(self) -> None:
+        target = self.cfg_dir / "plugins" / "agy-supervisor"
+        target.mkdir(parents=True)
+        conflicting = target / "agents" / "supervisor.md"
+        conflicting.parent.mkdir(parents=True)
+        conflicting.write_text("# UNMANAGED CONFLICT CONTENT\n", encoding="utf-8")
+
+        # Install with --overwrite-local
+        res = self.run_deploy("install", "--overwrite-local", "--skip-agy-validate")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Backed up", res.stdout)
+
+        # Check that a .bak.<timestamp> file was created
+        baks = list(conflicting.parent.glob("supervisor.md.bak.*"))
+        self.assertEqual(len(baks), 1)
+        self.assertEqual(baks[0].read_text(encoding="utf-8"), "# UNMANAGED CONFLICT CONTENT\n")
+        self.assertNotEqual(conflicting.read_text(encoding="utf-8"), "# UNMANAGED CONFLICT CONTENT\n")
+
+        # Locally modified managed file backup on update with --force
+        scout_md = target / "agents" / "scout.md"
+        scout_md.write_text("# LOCALLY MODIFIED SCOUT\n", encoding="utf-8")
+        upd = self.run_deploy("update", "--force", "--skip-agy-validate")
+        self.assertEqual(upd.returncode, 0, upd.stderr)
+        self.assertIn("Backed up", upd.stdout)
+
+        scout_baks = list(scout_md.parent.glob("scout.md.bak.*"))
+        self.assertEqual(len(scout_baks), 1)
+        self.assertEqual(scout_baks[0].read_text(encoding="utf-8"), "# LOCALLY MODIFIED SCOUT\n")
+        self.assertNotEqual(scout_md.read_text(encoding="utf-8"), "# LOCALLY MODIFIED SCOUT\n")
+
+    def test_default_model_in_launcher_and_env_override(self) -> None:
+        fake_agy = make_stub_bin(
+            self.root / "bin" / "fake-agy",
+            """
+import json, sys
+if sys.argv[1:3] == ["plugin", "validate"]:
+    print(json.dumps({"findings": []}))
+    sys.exit(0)
+if sys.argv[1:] == ["--version"]:
+    print("1.4.9")
+    sys.exit(0)
+print("ARGS:" + json.dumps(sys.argv[1:]))
+""",
+        )
+        env = dict(self.env, AGY_BIN=str(fake_agy))
+        inst = self.run_deploy("install", "--default-model", "test-model-xyz", "--skip-agy-validate", env=env)
+        self.assertEqual(inst.returncode, 0, inst.stderr)
+
+        launcher = self.prefix / "bin" / "agy-supervisor"
+        launcher_text = launcher.read_text(encoding="utf-8")
+        self.assertIn('MODEL="${AGY_SUPERVISOR_MODEL:-test-model-xyz}"', launcher_text)
+
+        # 1. Default invocation passes --model test-model-xyz
+        r1 = subprocess.run([str(launcher), "-p", "run1"], capture_output=True, text=True, env=env, check=False)
+        self.assertEqual(r1.returncode, 0)
+        self.assertIn('["--agent", "supervisor", "--model", "test-model-xyz", "-p", "run1"]', r1.stdout)
+
+        # 2. AGY_SUPERVISOR_MODEL environment override
+        env_override = dict(env, AGY_SUPERVISOR_MODEL="env-model-abc")
+        r2 = subprocess.run([str(launcher), "-p", "run2"], capture_output=True, text=True, env=env_override, check=False)
+        self.assertEqual(r2.returncode, 0)
+        self.assertIn('["--agent", "supervisor", "--model", "env-model-abc", "-p", "run2"]', r2.stdout)
+
+        # 3. Explicit -m flag omits launcher default model
+        r3 = subprocess.run([str(launcher), "-m", "flag-model", "-p", "run3"], capture_output=True, text=True, env=env, check=False)
+        self.assertEqual(r3.returncode, 0)
+        self.assertIn('["--agent", "supervisor", "-m", "flag-model", "-p", "run3"]', r3.stdout)
+
+        # 4. Explicit --model flag omits launcher default model
+        r4 = subprocess.run([str(launcher), "--model", "flag-model-2", "-p", "run4"], capture_output=True, text=True, env=env, check=False)
+        self.assertEqual(r4.returncode, 0)
+        self.assertIn('["--agent", "supervisor", "--model", "flag-model-2", "-p", "run4"]', r4.stdout)
+
+        # 5. Explicit --model=flag-model-3 flag omits launcher default model
+        r5 = subprocess.run([str(launcher), "--model=flag-model-3", "-p", "run5"], capture_output=True, text=True, env=env, check=False)
+        self.assertEqual(r5.returncode, 0)
+        self.assertIn('["--agent", "supervisor", "--model=flag-model-3", "-p", "run5"]', r5.stdout)
+
+    def test_update_preserves_default_model(self) -> None:
+        inst = self.run_deploy("install", "--default-model", "initial-model", "--skip-agy-validate")
+        self.assertEqual(inst.returncode, 0, inst.stderr)
+
+        target = self.cfg_dir / "plugins" / "agy-supervisor"
+        manifest = json.loads((target / ".agy-supervisor-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["default_model"], "initial-model")
+
+        # Update without specifying --default-model preserves initial-model
+        upd = self.run_deploy("update", "--skip-agy-validate")
+        self.assertEqual(upd.returncode, 0, upd.stderr)
+        manifest2 = json.loads((target / ".agy-supervisor-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest2["default_model"], "initial-model")
+
+        launcher = self.prefix / "bin" / "agy-supervisor"
+        self.assertIn('MODEL="${AGY_SUPERVISOR_MODEL:-initial-model}"', launcher.read_text(encoding="utf-8"))
+
+        # Explicitly updating --default-model updates it
+        upd2 = self.run_deploy("update", "--default-model", "updated-model", "--skip-agy-validate")
+        self.assertEqual(upd2.returncode, 0, upd2.stderr)
+        manifest3 = json.loads((target / ".agy-supervisor-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest3["default_model"], "updated-model")
+        self.assertIn('MODEL="${AGY_SUPERVISOR_MODEL:-updated-model}"', launcher.read_text(encoding="utf-8"))
+
+    def test_update_all(self) -> None:
+        # Install global install and workspace install
+        inst1 = self.run_deploy("install", "--tag", "prod", "--skip-agy-validate")
+        self.assertEqual(inst1.returncode, 0, inst1.stderr)
+
+        inst2 = self.run_deploy("install", "--tag", "ws", "--workspace", str(self.workspace), "--skip-agy-validate")
+        self.assertEqual(inst2.returncode, 0, inst2.stderr)
+
+        # Combining --all with --tag or --workspace fails
+        res_fail1 = self.run_deploy("update", "--all", "--tag", "prod", "--skip-agy-validate")
+        self.assertEqual(res_fail1.returncode, 1)
+        self.assertIn("cannot combine --all", res_fail1.stderr)
+
+        res_fail2 = self.run_deploy("update", "--all", "--workspace", str(self.workspace), "--skip-agy-validate")
+        self.assertEqual(res_fail2.returncode, 1)
+        self.assertIn("cannot combine --all", res_fail2.stderr)
+
+        # Run update --all
+        res_all = self.run_deploy("update", "--all", "--skip-agy-validate")
+        self.assertEqual(res_all.returncode, 0, res_all.stderr)
+        self.assertIn("Updated agy-prod", res_all.stdout)
+        self.assertIn("Updated agy-ws", res_all.stdout)
+
+    def test_update_from_dir(self) -> None:
+        inst = self.run_deploy("install", "--skip-agy-validate")
+        self.assertEqual(inst.returncode, 0, inst.stderr)
+
+        # Create a mock source directory with VERSION 9.9 and an updated file
+        source_dir = self.root / "mock-source"
+        source_pack = source_dir / "pack"
+        shutil.copytree(str(REPO_ROOT / "pack"), str(source_pack))
+        (source_dir / "VERSION").write_text("9.9\n", encoding="utf-8")
+        custom_file = source_pack / "custom_marker.txt"
+        custom_file.write_text("CUSTOM_SOURCE_PAYLOAD\n", encoding="utf-8")
+
+        upd = self.run_deploy("update", "--from", str(source_dir), "--skip-agy-validate")
+        self.assertEqual(upd.returncode, 0, upd.stderr)
+
+        target = self.cfg_dir / "plugins" / "agy-supervisor"
+        manifest = json.loads((target / ".agy-supervisor-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["version"], "9.9")
+        self.assertTrue((target / "custom_marker.txt").is_file())
+        self.assertEqual((target / "custom_marker.txt").read_text(encoding="utf-8"), "CUSTOM_SOURCE_PAYLOAD\n")
+
+    def test_conflict_refusal_without_force(self) -> None:
+        target = self.cfg_dir / "plugins" / "agy-supervisor"
+        target.mkdir(parents=True)
+        conflicting = target / "agents" / "supervisor.md"
+        conflicting.parent.mkdir(parents=True)
+        conflicting.write_text("# UNMANAGED CONFLICT\n", encoding="utf-8")
+
+        # Install without force should fail
+        res_inst = self.run_deploy("install", "--skip-agy-validate")
+        self.assertEqual(res_inst.returncode, 1)
+        self.assertIn("unmanaged file conflict", res_inst.stderr)
+        self.assertIn("--force", res_inst.stderr)
+
+        # Install with force succeeds
+        res_inst_force = self.run_deploy("install", "--force", "--skip-agy-validate")
+        self.assertEqual(res_inst_force.returncode, 0, res_inst_force.stderr)
+
+        # Modify managed file locally
+        conflicting.write_text("# MODIFIED MANAGED\n", encoding="utf-8")
+
+        # Re-running install without force fails
+        res_inst_mod = self.run_deploy("install", "--skip-agy-validate")
+        self.assertEqual(res_inst_mod.returncode, 1)
+        self.assertIn("locally modified managed file", res_inst_mod.stderr)
+
+        # Running update without force preserves it
+        res_upd = self.run_deploy("update", "--skip-agy-validate")
+        self.assertEqual(res_upd.returncode, 0, res_upd.stderr)
+        self.assertIn("Preserving 1 locally modified file", res_upd.stdout)
+        self.assertEqual(conflicting.read_text(encoding="utf-8"), "# MODIFIED MANAGED\n")
 
 
 if __name__ == "__main__":

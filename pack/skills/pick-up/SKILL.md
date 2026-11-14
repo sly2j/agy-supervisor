@@ -1,25 +1,35 @@
 ---
 name: pick-up
-description: Resume an existing project quickly by loading .supervisor/ state, git status, and open blockers.
+description: Re-enter a plan or program with one read-only state check, a short report, and a proposed next step, or pick tasks. Use when resuming a plan, checking progress, or picking tasks from project memory.
 disable-model-invocation: true
 ---
 
-# Session Pick-Up Protocol
+# Pick up
 
-Orient quickly at the start of a resumed session without reading the entire repository blind.
+Dispatch one `scout` plan-state call; never read the plan yourself.
 
-## Steps
-
-1. **Read project rules & status**:
-   - Inspect `GEMINI.md` (if present) and `.supervisor/roadmap.md`.
-   - Read the last ~60 lines of `.supervisor/history.md`.
-2. **Inspect live repo state**:
-   - Dispatch `scout` or `git-ops` to inspect `git status --short`, current branch,
-     `git log -n 5 --oneline`, and `git worktree list` (without modifying files).
-3. **Load targeted domain memory**:
-   - Open relevant files under `.supervisor/memory/decisions/` or `conventions/` matching
-     the user's next goal.
-4. **Confirm active direction**:
-   - Present a crisp 4–8 line status brief: current branch, clean/dirty files, open
-     roadmap item, any blockers, and proposed first step.
-   - Ask the user for confirmation if multiple roadmap tracks compete for priority.
+- Target: the plan named in the prompt or request, else `.supervisor/working/plans/`. Cards named
+  in the prompt or request (names or paths under `.supervisor/tasks/`) are the pick.
+- Ask `scout` for the plan, its packages or open `## Todo`, the last Log lines and any pending
+  questions.
+- Report at most 10 lines: plan, packages or open `## Todo`, last Log lines, pending questions.
+- Propose the next step and wait for the user:
+  - packages remain: the next wave;
+  - flat plan with open slices: `executor` on them;
+  - `## Todo` complete: `/close-out`.
+- With no live plan, or when the user asks for a new task, work in the default-branch checkout, or
+  in the linked worktree the session is in:
+  - when `.supervisor/roadmap.md` exists (Glob), dispatch `curator` `make this a project` first;
+  - dispatch one `scout` task list, also reporting the branch and linked-worktree state, and let
+    the user pick one or more cards (not asked when the prompt or request names them);
+  - read the picked cards (at most 200 words each) and route their texts as one prompt, exactly
+    as the user's prompt would be routed (any lead or chain, or the quick tier); the planner
+    stage gives the cards one shared plan path;
+  - unless quick tier (finish with `close-out task <card>`), brief `fixer` one exact edit per
+    card replacing the text `status: open` with `status: active`, setting `owner` (the
+    branch, default `<type>/<first card slug>`, or the worktree's branch), `since` (today) and
+    `plan` (the default plan path the planner will be briefed with, only when the route has a
+    planner stage); when `fixer` reports that text missing, list again; then `git-ops` the
+    commit `chore(memory): claim <card>[, <card>]` (skipped for a local store);
+  - pass the card paths, and the branch name to a lead, in the first brief; in a worktree also
+    its path.

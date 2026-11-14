@@ -1,21 +1,12 @@
-# Decision: <Short Title>
-
-- **Date**: YYYY-MM-DD
-- **Status**: Accepted | Superseded | Proposed
-- **Scope**: <affected modules, scripts, or docs>
-
-## Context
-
-One short paragraph explaining the problem or constraint encountered.
-
-## Decision
-
-Exact technical choice made and key parameters.
-
-## Alternatives Considered
-
-- **Option A**: brief note on why it was rejected.
-
-## Consequences
-
-- Downstream impacts, trade-offs, or invariants future agents must preserve.
+---
+domain: code
+summary: <one line; the grep target>
+affects: [<path>, <dir/>]
+verified: YYYY-MM-DD
+source: <plan or research path, or user YYYY-MM-DD>
+supersedes:
+---
+The choice, found fact or aim in one or two present-tense sentences.
+Why: the drivers.
+Rejected: the alternatives and why not (decisions and conventions only).
+Behaviour stays in the `affects:` files; do not restate it.

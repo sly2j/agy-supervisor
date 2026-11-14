@@ -1,14 +1,20 @@
 """Tests for ./deploy memory externalize, link, and status commands."""
 
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY = REPO_ROOT / "deploy"
+
+deploy_module = SourceFileLoader("deploy", str(DEPLOY)).load_module()
+plan_memory_grant = deploy_module.plan_memory_grant
+memory_grant = deploy_module.memory_grant
 
 
 def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -130,6 +136,135 @@ class DeployMemoryTest(unittest.TestCase):
         )
         self.assertEqual(fail_nested.returncode, 1)
         self.assertIn("lies inside checkout", fail_nested.stderr)
+
+    def test_plan_memory_grant(self) -> None:
+        root_path = Path("/mock/shared/memory/project-a")
+        dir_g, rule_g = memory_grant(root_path)
+        self.assertEqual(dir_g, "/mock/shared/memory/project-a")
+        self.assertEqual(rule_g, "Edit(/mock/shared/memory/project-a/**)")
+
+        initial_settings = {
+            "trustedWorkspaces": ["/path/to/ws"],
+            "permissions": {
+                "allow": ["Bash(ls)"],
+            },
+        }
+
+        new_settings, added = plan_memory_grant(initial_settings, root_path)
+        self.assertIsNotNone(new_settings)
+        self.assertEqual(new_settings["trustedWorkspaces"], ["/path/to/ws"])
+        perms = new_settings["permissions"]
+        self.assertIn("/mock/shared/memory/project-a", perms["additionalDirectories"])
+        self.assertIn("Edit(/mock/shared/memory/project-a/**)", perms["allow"])
+        self.assertIn("Bash(ls)", perms["allow"])
+        self.assertEqual(added["additionalDirectories"], ["/mock/shared/memory/project-a"])
+        self.assertEqual(added["allow"], ["Edit(/mock/shared/memory/project-a/**)"])
+
+        # Second run with same settings returns None and empty added lists
+        noop_settings, noop_added = plan_memory_grant(new_settings, root_path)
+        self.assertIsNone(noop_settings)
+        self.assertEqual(noop_added["additionalDirectories"], [])
+        self.assertEqual(noop_added["allow"], [])
+
+    def test_externalize_wires_settings_grant(self) -> None:
+        self.cli_dir.mkdir(parents=True, exist_ok=True)
+        (self.cli_dir / "settings.json").write_text(
+            json.dumps({"trustedWorkspaces": [str(self.repo)]}), encoding="utf-8"
+        )
+
+        ext = self.run_deploy(
+            "memory",
+            "externalize",
+            "--project",
+            str(self.repo),
+            "--store-root",
+            str(self.mem_root),
+        )
+        self.assertEqual(ext.returncode, 0, ext.stderr)
+
+        settings_path = self.cli_dir / "settings.json"
+        self.assertTrue(settings_path.is_file())
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(settings["trustedWorkspaces"], [str(self.repo)])
+
+        ext_dir = (self.mem_root / "sample-repo").resolve()
+        expected_dir = str(ext_dir)
+        expected_rule = f"Edit(/{expected_dir.lstrip('/')}/**)"
+
+        perms = settings.get("permissions", {})
+        self.assertIn(expected_dir, perms.get("additionalDirectories", []))
+        self.assertIn(expected_rule, perms.get("allow", []))
+
+    def test_dry_run_creates_no_grants(self) -> None:
+        # With non-existent settings.json
+        res1 = self.run_deploy(
+            "memory",
+            "externalize",
+            "--dry-run",
+            "--project",
+            str(self.repo),
+            "--store-root",
+            str(self.mem_root),
+        )
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+        self.assertFalse((self.cli_dir / "settings.json").exists())
+
+        # With pre-existing settings.json
+        self.cli_dir.mkdir(parents=True, exist_ok=True)
+        initial_content = json.dumps({"trustedWorkspaces": ["/tmp/safe"]}) + "\n"
+        (self.cli_dir / "settings.json").write_text(initial_content, encoding="utf-8")
+
+        res2 = self.run_deploy(
+            "memory",
+            "externalize",
+            "--dry-run",
+            "--project",
+            str(self.repo),
+            "--store-root",
+            str(self.mem_root),
+        )
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        self.assertEqual((self.cli_dir / "settings.json").read_text(encoding="utf-8"), initial_content)
+
+    def test_dangling_symlink_detection_and_repair(self) -> None:
+        # First externalize successfully
+        ext = self.run_deploy(
+            "memory",
+            "externalize",
+            "--project",
+            str(self.repo),
+            "--store-root",
+            str(self.mem_root),
+        )
+        self.assertEqual(ext.returncode, 0, ext.stderr)
+
+        # Break the .supervisor symlink so it dangles
+        sup_link = self.repo / ".supervisor"
+        sup_link.unlink()
+        broken_target = self.root / "nonexistent-memory-target"
+        os.symlink(str(broken_target), str(sup_link))
+
+        # Status check must detect the dangling symlink
+        stat_fail = self.run_deploy("memory", "status", "--project", str(self.repo))
+        self.assertEqual(stat_fail.returncode, 1)
+        self.assertIn("dangling symlink", stat_fail.stdout)
+
+        # Repair with memory link --repair
+        link_repair = self.run_deploy(
+            "memory",
+            "link",
+            "--project",
+            str(self.repo),
+            "--store-root",
+            str(self.mem_root),
+            "--repair",
+        )
+        self.assertEqual(link_repair.returncode, 0, link_repair.stderr)
+
+        # Status check now reports ok
+        stat_ok = self.run_deploy("memory", "status", "--project", str(self.repo))
+        self.assertEqual(stat_ok.returncode, 0, stat_ok.stdout + stat_ok.stderr)
+        self.assertIn("ok:", stat_ok.stdout)
 
 
 if __name__ == "__main__":

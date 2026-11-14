@@ -16,9 +16,68 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 VALID_BACKENDS = ("claude", "codex")
-VALID_DOMAINS = ("research", "plan", "code", "prose")
+VALID_DOMAINS = ("research", "plan", "code", "prose", "agent-definition")
 VALID_EFFORTS = ("low", "medium", "high", "max")
 DEFAULT_TIMEOUT_SEC = 240
+
+DOMAIN_SKILLS = {
+    "plan": ("pack/skills/plan-writing/SKILL.md",),
+    "agent-definition": ("pack/skills/agent-authoring/SKILL.md",),
+    "prose": (
+        "pack/skills/science-writing-style/SKILL.md",
+        "pack/skills/presentation-style/SKILL.md",
+        "pack/skills/project-memory/references/writing.md",
+    ),
+}
+
+
+def resolve_skill_path(pack_root: Path, rel: str) -> Optional[Path]:
+    candidates = [
+        pack_root / rel,
+        pack_root.parent / rel,
+    ]
+    if rel.startswith("pack/"):
+        candidates.append(pack_root / rel[len("pack/") :])
+    elif not rel.startswith("pack/"):
+        candidates.append(pack_root / f"pack/{rel}")
+    for cand in candidates:
+        if cand.is_file():
+            return cand
+    return None
+
+
+def strip_frontmatter(text: str) -> str:
+    text = text.replace("\r\n", "\n")
+    if text.startswith("---\n"):
+        end_idx = text.find("\n---\n", 4)
+        if end_idx != -1:
+            return text[end_idx + 5 :].lstrip("\n")
+        end_idx = text.find("\n---", 4)
+        if end_idx != -1 and (end_idx + 4 == len(text) or text[end_idx + 4] == "\n"):
+            return text[end_idx + 4 :].lstrip("\n")
+    return text
+
+
+def unwrap_fence(text: str) -> str:
+    stripped = (text or "").strip()
+    fence_match = re.match(r"^(`{3,})[^\n]*\n", stripped)
+    if fence_match:
+        fence = fence_match.group(1)
+        rest = stripped[fence_match.end() :]
+        closing = rest.rstrip()
+        if closing.endswith(fence):
+            rest = closing[: -len(fence)]
+        return rest.strip()
+    return stripped
+
+
+def split_table_row(line: str) -> List[str]:
+    tokens = re.split(r"(?<!\\)\|", line)
+    if tokens and not tokens[0].strip():
+        tokens = tokens[1:]
+    if tokens and not tokens[-1].strip():
+        tokens = tokens[:-1]
+    return [t.strip() for t in tokens]
 
 
 def default_config_path() -> Path:
@@ -83,7 +142,10 @@ def find_binary(name: str) -> Optional[str]:
 
 
 def check_auth(backend: str, binary: str, timeout: int = 8) -> Tuple[bool, str]:
-    cmd = [binary, "auth", "status", "--json"] if backend == "claude" else [binary, "login", "status"]
+    if backend == "claude":
+        cmd = [binary, "auth", "status", "--json"]
+    else:
+        cmd = [binary, "login", "status"]
     try:
         proc = subprocess.run(
             cmd,
@@ -169,47 +231,138 @@ def resolve_target(
     return str(backend), (str(model) if model else None), (str(effort) if effort else None)
 
 
-def validate_block(text: str) -> Tuple[bool, str]:
-    stripped = (text or "").strip()
+def validate_block(text: str, round_no: int = 1) -> Tuple[bool, str]:
+    stripped = unwrap_fence(text)
     if not stripped:
         return False, "empty critic output"
-    verdict_match = re.search(
-        r"^##\s+Verdict\b(.*)$", stripped, flags=re.MULTILINE | re.IGNORECASE | re.DOTALL
-    )
-    if not verdict_match:
-        return False, "missing '## Verdict' section"
-    after_heading = verdict_match.group(1)
-    next_heading = re.search(r"^##\s+\S", after_heading, flags=re.MULTILINE)
-    verdict_body = after_heading[: next_heading.start()] if next_heading else after_heading
-    has_approve = bool(re.search(r"\bAPPROVE\b", verdict_body))
-    has_changes = bool(re.search(r"\bREQUEST\s+CHANGES\b", verdict_body))
-    if not (has_approve or has_changes):
-        return False, "verdict section missing APPROVE or REQUEST CHANGES"
-    if has_approve and has_changes:
-        return False, "ambiguous verdict containing both APPROVE and REQUEST CHANGES"
-    if not re.search(r"^##\s+Findings\b", stripped, flags=re.MULTILINE | re.IGNORECASE):
-        return False, "missing '## Findings' section"
+
+    lines = [line.strip() for line in stripped.splitlines()]
+    if len(lines) < 2:
+        return False, "critic output too short (missing verdict or round)"
+
+    m1 = re.match(r"^VERDICT: (PASS|REVISE)$", lines[0])
+    if not m1:
+        return False, "line 1 must match 'VERDICT: (PASS|REVISE)'"
+    verdict = m1.group(1)
+
+    m2 = re.match(r"^ROUND: (\d+)$", lines[1])
+    if not m2:
+        return False, "line 2 must match 'ROUND: <round_no>'"
+    if int(m2.group(1)) != round_no:
+        return False, f"round mismatch: expected {round_no}, got {m2.group(1)}"
+
+    expected_headers = ["id", "severity", "location", "finding", "evidence", "minimal fix"]
+    valid_severities = {"BLOCKING", "SHOULD", "NIT"}
+
+    header_found = False
+    in_table = False
+    table_done = False
+    has_blocking = False
+    validation_lines: List[str] = []
+    notes_lines: List[str] = []
+
+    for line in lines[2:]:
+        if not line:
+            if in_table:
+                in_table = False
+                table_done = True
+            continue
+
+        if line.startswith("VALIDATION:"):
+            in_table = False
+            table_done = True
+            if header_found:
+                validation_lines.append(line)
+            continue
+
+        if line.startswith("NOTES:"):
+            in_table = False
+            table_done = True
+            if header_found:
+                notes_lines.append(line)
+            continue
+
+        if "|" in line:
+            if table_done:
+                return False, "table row appeared after findings table was closed"
+            cells = split_table_row(line)
+            lower_cells = [c.lower() for c in cells]
+            if not header_found:
+                if lower_cells == expected_headers:
+                    header_found = True
+                    in_table = True
+                    continue
+                continue
+
+            if in_table:
+                if cells and all(re.match(r"^:?-+:?$", c) for c in cells):
+                    continue
+
+                if len(cells) != 6:
+                    return False, f"finding row has {len(cells)} cells; expected 6"
+
+                sev = cells[1].strip()
+                if sev not in valid_severities:
+                    return False, f"invalid severity '{sev}'; expected BLOCKING, SHOULD, or NIT"
+
+                if sev == "BLOCKING":
+                    has_blocking = True
+                continue
+
+    if not header_found:
+        return False, "missing findings table header"
+
+    if len(validation_lines) != 1:
+        return False, f"expected exactly one VALIDATION line, got {len(validation_lines)}"
+
+    if len(notes_lines) != 1:
+        return False, f"expected exactly one NOTES line, got {len(notes_lines)}"
+
+    if has_blocking and verdict != "REVISE":
+        return False, "verdict disagrees with rows (REVISE iff a BLOCKING row)"
+    if not has_blocking and verdict != "PASS":
+        return False, "verdict disagrees with rows (REVISE iff a BLOCKING row)"
+
     return True, "ok"
 
 
-def build_review_prompt(domain: str, prompt_text: str, diff_text: Optional[str]) -> str:
+def build_review_prompt(
+    domain: str,
+    prompt_text: str,
+    diff_text: Optional[str],
+    round_no: int = 1,
+) -> str:
+    pack_root = Path(__file__).resolve().parents[3]
     parts = [
         f"You are an independent cross-family adversarial {domain} critic.",
         "Do NOT modify files or perform writes; review strictly in read-only mode.",
         "Identify bugs, missing edge cases, unverified claims, security/safety flaws, "
         "or requirement gaps.",
         "",
-        "Format your response in Markdown with these required headings:",
-        "## Verdict",
-        "State exactly `APPROVE` or `REQUEST CHANGES` with a one-sentence rationale.",
-        "## Findings",
-        "Bullet list of concrete issues with file paths, lines, or evidence (`None.` if clean).",
-        "## Verification",
-        "Note checks inspected, coverage gaps, or tests that must still pass.",
+        "Format instructions:",
+        "Line 1 must be `VERDICT: PASS` or `VERDICT: REVISE`",
+        f"Line 2 must be `ROUND: {round_no}`",
         "",
-        "--- REVIEW PACKET ---",
-        prompt_text.strip(),
+        "Findings table: 6 columns:",
+        "| ID | Severity | Location | Finding | Evidence | Minimal fix |",
+        "|---|---|---|---|---|---|",
+        "",
+        "Severities allowed: BLOCKING, SHOULD, NIT",
+        "Severity invariant: REVISE iff at least one BLOCKING finding is present. "
+        "If 0 findings or only SHOULD/NIT, verdict is PASS.",
+        "",
+        "Footer line: VALIDATION: <one line summary>",
+        "Footer line: NOTES: <one line notes>",
     ]
+
+    for rel in DOMAIN_SKILLS.get(domain, ()):
+        target = resolve_skill_path(pack_root, rel)
+        if target and target.is_file():
+            raw_text = target.read_text(encoding="utf-8")
+            body = strip_frontmatter(raw_text).strip()
+            parts.extend(["", f"## Skill: {rel}", "", body])
+
+    parts.extend(["", "--- REVIEW PACKET ---", prompt_text.strip()])
     if diff_text is not None and diff_text.strip():
         parts.extend(["", "--- DIFF ---", "```diff", diff_text.rstrip(), "```"])
     return "\n".join(parts) + "\n"
@@ -346,7 +499,10 @@ def cmd_enable(args: argparse.Namespace, cfg_path: Path) -> int:
     for needed in sorted(needed_backends):
         binary = find_binary(needed)
         if not binary:
-            print(f"error: '{needed}' CLI binary not found on PATH or ~/.local/bin", file=sys.stderr)
+            print(
+                f"error: '{needed}' CLI binary not found on PATH or ~/.local/bin",
+                file=sys.stderr,
+            )
             return 1
         if not args.skip_auth_check:
             ok, detail = check_auth(needed, binary)
@@ -433,7 +589,8 @@ def cmd_review(args: argparse.Namespace, cfg_path: Path) -> int:
             return 1
         diff_text = diff_path.read_text(encoding="utf-8")
 
-    composed = build_review_prompt(domain, prompt_text, diff_text)
+    round_no = getattr(args, "round", 1) or 1
+    composed = build_review_prompt(domain, prompt_text, diff_text, round_no)
     try:
         rc, stdout, stderr = invoke_backend(
             backend=backend,
@@ -459,7 +616,7 @@ def cmd_review(args: argparse.Namespace, cfg_path: Path) -> int:
         print(f"EXTERNAL_CRITIC_FALLBACK: {backend} exited non-zero ({msg})", file=sys.stderr)
         return 3
 
-    valid, reason = validate_block(stdout)
+    valid, reason = validate_block(stdout, round_no)
     if not valid:
         print(
             f"EXTERNAL_CRITIC_FALLBACK: {backend} output failed validation ({reason})",
@@ -467,7 +624,7 @@ def cmd_review(args: argparse.Namespace, cfg_path: Path) -> int:
         )
         return 3
 
-    rendered = stdout.strip() + "\n"
+    rendered = unwrap_fence(stdout) + "\n"
     if args.output:
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -509,14 +666,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-auth-check", action="store_true", help="Skip live CLI auth probe during enable"
     )
 
-    sub.add_parser("disable", parents=[common], help="Disable external critic and use native critic")
+    sub.add_parser(
+        "disable", parents=[common], help="Disable external critic and use native critic"
+    )
 
     p_review = sub.add_parser("review", parents=[common], help="Probe or run external review")
     p_review.add_argument(
-        "--domain", default="code", help="Review domain (research|plan|code|prose)"
+        "--domain",
+        default="code",
+        choices=VALID_DOMAINS,
+        help=f"Review domain ({'|'.join(VALID_DOMAINS)})",
     )
     p_review.add_argument(
         "--probe", action="store_true", help="Check if an external critic is active for domain"
+    )
+    p_review.add_argument(
+        "--round",
+        type=int,
+        default=1,
+        help="Review round number (default: 1)",
     )
     p_review.add_argument("--prompt-file", help="Path to self-contained review packet")
     p_review.add_argument("--diff-file", help="Optional patch/diff file appended to prompt")

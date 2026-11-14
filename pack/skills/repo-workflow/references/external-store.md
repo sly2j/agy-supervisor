@@ -1,28 +1,28 @@
-# Externalized Memory Store (`deploy memory`)
+# Externalized Store
 
-Some repositories cannot or should not track `.supervisor/` in git (shared upstream repos,
-strict PR policies, or read-only vendor trees).
+A project's `.supervisor` (and `GEMINI.local.md`) may be a symlink into a directory outside the
+repo, often inside another git repo that holds the memory.
 
-## How Externalization Works
+## Detect
 
-Use the `deploy memory` subcommand (installed via `agy-supervisor memory` or `./deploy memory`):
+- `[ -L .supervisor ]` means the store is externalized.
+- `git -C "$(readlink -f .supervisor)" rev-parse --show-toplevel` differing from the project
+  toplevel means the target lies in another git repo (`<repo>`).
 
-```bash
-agy-supervisor memory externalize --project /path/to/repo
-```
+## Worktree cut
 
-This command:
-1. Moves or initializes the store under the prefix memory root
-   (`~/.local/share/agy-supervisor/memory/<repo-key>/`).
-2. Replaces `<repo>/.supervisor` with a symlink pointing to that external store directory.
-3. Adds `.supervisor` to `<repo>/.git/info/exclude` (local git exclude, not tracked
-   `.gitignore`), keeping upstream diffs completely clean.
+When the executor cuts a worktree, link the store in so every worktree shares it. For each of
+`.supervisor` and `GEMINI.local.md` that is a symlink in the main checkout, run
+`ln -s "$(readlink <main>/<item>)" <wt>/<item>`.
 
-## Linking & Checking Status
+## Committing the external repo
 
-- Re-link a fresh clone on the same machine:
-  `agy-supervisor memory link --project /path/to/clone`
-- Inspect whether a repository uses in-repo or externalized `.supervisor/`:
-  `agy-supervisor memory status --project /path/to/repo`
+At close-out and after program waves, when briefed `external store: <repo toplevel>`:
+1. `<external dir>` is the parent project directory of the resolved symlink target in `<repo>`.
+2. `git -C <repo> add -A -- <external dir>`.
+3. Pathspec commit: `git -C <repo> commit -m "chore(memory): <name>: <what>" -- <external dir>`,
+   with the `git-safety` trailer (`Co-Authored-By: Supervisor for Antigravity`).
 
-Note: both forms present identical `.supervisor/` paths to agents and skills.
+Never push or pull in `<repo>`, never stage or touch residue there, and never stage anything in
+the project checkout for this commit. `repo-workflow` Sync With Origin does not apply to
+`<repo>`.

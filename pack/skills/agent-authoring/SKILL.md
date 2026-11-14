@@ -1,69 +1,94 @@
 ---
 name: agent-authoring
-description: Authoring and lint conventions for Supervisor for Antigravity agents and skills.
+description: Conventions for writing and reviewing Antigravity subagent and skill definitions in the Supervisor for Antigravity pack (tiers, models, tool restrictions, prompt structure, report contracts, scope boundaries). Use when creating, editing, or critiquing files under pack/agents or pack/skills.
 ---
 
-# Agent and Skill Authoring Conventions
-
-Use these rules when adding or modifying agents (`pack/agents/*.md`) or skills
-(`pack/skills/*/SKILL.md`). Every bundle must pass `agy plugin validate --strict --json`.
+# Agent And Skill Authoring
 
 ## Tiers
 
-| Role | Agents | Model | Flags (`mainAgent` / `subagent`) | Preloaded Skills |
-| :--- | :--- | :--- | :--- | :--- |
-| Main | `supervisor` | `inherit` | `true` / `false` | `—` |
-| Lead | `researcher` | `pro` | `false` / `true` | `lead-loop`, `residue` |
-| Lead | `planner` | `pro` | `false` / `true` | `lead-loop`, `plan-writing`, `repo-workflow` |
-| Lead | `executor` | `flash` | `false` / `true` | `lead-loop`, `git-safety`, `repo-workflow`, `residue` |
-| Lead | `writer` | `pro` | `false` / `true` | `lead-loop`, `project-memory` |
-| Worker | `researcher-worker` | `flash` | `false` / `true` | `residue` |
-| Worker | `planner-worker` | `flash` | `false` / `true` | `—` |
-| Worker | `executor-worker` | `flash` | `false` / `true` | `residue` |
-| Worker | `writer-worker` | `pro` | `false` / `true` | `project-memory` |
-| Reviewer | `critic` | `pro` | `false` / `true` | `—` |
-| Reviewer | `scope-critic` | `pro` | `false` / `true` | `—` |
-| Memory | `curator` | `flash` | `false` / `true` | `project-memory` |
-| Quick | `fixer` | `flash_lite` | `false` / `true` | `project-memory`, `residue` |
-| Quick | `git-ops` | `flash_lite` | `false` / `true` | `git-safety`, `repo-workflow` |
-| Quick | `scout` | `flash_lite` | `false` / `true` | `—` |
+| Tier | Agents | Model / effort | Tools |
+|---|---|---|---|
+| Main | supervisor | inherit (Gemini 4 Carbon) / default | no run_command, no manage_task; writes only its memory files |
+| Lead | researcher | pro / default | all; preload `lead-loop` |
+| Lead | executor | pro / default | all; preload `lead-loop` |
+| Lead | writer | inherit (Carbon) / default | all; preload `lead-loop`, `project-memory` |
+| Lead | planner | pro / default | all; preload `lead-loop`, `plan-writing` |
+| Worker | researcher-worker, planner-worker, executor-worker | flash / default | no `invoke_subagent` |
+| Worker | writer-worker | pro / default | no `invoke_subagent` |
+| Review | critic | pro / default | read-only plus run_command; no `invoke_subagent` |
+| Review | scope-critic | pro / default | read-only, no run_command, no `invoke_subagent` |
+| Memory | curator | flash / default | explicit allowlist; no `invoke_subagent` |
+| Quick | fixer, git-ops, scout | flash_lite / default | explicit allowlist; no `invoke_subagent` |
 
-## Antigravity Frontmatter Rules
+- Depth is main (0) -> lead or curator (1) -> worker or reviewer (2). Nothing below depth 2
+  dispatches.
+- Antigravity model tiers are `inherit`, `pro`, `flash`, and `flash_lite`.
+- Tools must be declared explicitly from the supported Antigravity tools (`read_file`, `write_file`,
+  `edit_file`, `run_command`, `manage_task`, `search_web`, `invoke_subagent`, `send_message`,
+  `ask_question`). Never use banned agent keys (`disallowedTools`, `effort`, `color`,
+  `enableSubagentTools`).
+- One critic serves all domains. Add domain criteria to `critic.md` or to a skill it loads, not as a
+  new critic agent.
 
-Agents accept only valid Antigravity frontmatter fields:
-- `name`, `description`, `model` (`inherit`, `pro`, `flash`, or `flash_lite`)
-- `mainAgent` (`true` on `supervisor`, `false` on all others) and `subagent` (inverse)
-- `tools`: explicit native tool list (`read_file`, `write_file`, `edit_file`, `run_command`,
-  `manage_task`, `search_web`, `invoke_subagent`, `define_subagent`, `manage_subagents`,
-  `send_message`, `ask_question`)
-- `agents`: subagent allowlist on `supervisor` and leads (`—` omit on leaf agents)
-- `skills`: preloaded skill names when used regularly
+## Word Caps
 
-Never emit unsupported fields (`disallowedTools`, `effort`, `color`, `enableSubagentTools`).
-At runtime, callers may pass a per-call `Model` (`pro`, `flash`, `flash_lite`, `inherit`)
-to `invoke_subagent` to step up or down within a turn.
+| Role | Agents | Body Word Cap |
+|---|---|---|
+| Main | supervisor | 1000 |
+| Lead | researcher, planner, executor, writer | 700 |
+| Review | critic, scope-critic | 600 |
+| Worker | researcher-worker, planner-worker, executor-worker, writer-worker | 400 |
+| Memory | curator | 400 |
+| Quick | fixer, git-ops, scout | 350 |
 
-Skills accept only `name` (must equal parent folder name), `description`, and optional
-`disable-model-invocation: true`. Do not emit `user-invocable`, `context: fork`, or
-`argument-hint`. Reference bundled files using relative markdown paths such as
-`./references/...` or `./scripts/...`.
+Skills have a hard limit of 1380 body words (except `residue` which has a cap of 350 words),
+at most 300 lines, and a file size under 24,000 bytes. The linter enforces all caps strictly.
+Caps are ceilings, not targets: spend length on load-bearing contracts such as verdict tokens,
+output schemas, and routing tables.
 
-## Tool Boundaries
+## Agent Files
 
-- `supervisor`: no `run_command` or `manage_task`; delegates work and git ops to subagents.
-- Leads: carry `invoke_subagent`, `define_subagent`, `manage_subagents`, `send_message`, and
-  may inspect or verify directly, while delegating substantive edits or multi-file sweeps.
-- Workers & leaf agents: never list `agents` and never carry `invoke_subagent`,
-  `define_subagent`, or `manage_subagents`.
-- `planner-worker`, `critic`: read-only file access (`read_file`, `run_command`, `manage_task`,
-  `search_web`); no `write_file` or `edit_file`.
-- `scope-critic`: `read_file` only.
-- `curator` and `fixer`: must explicitly forbid running `git commit`.
+- Frontmatter:
+  - `name` (kebab-case, equal to the filename stem)
+  - `description` (one sentence that says what and when, driving Antigravity routing)
+  - `model` (one of `inherit`, `pro`, `flash`, `flash_lite`)
+  - `tools` (explicit list of valid tools)
+  - `mainAgent: true` and `subagent: false` for `supervisor`; `mainAgent: false` and
+    `subagent: true` for all other agents
+  - `agents` (list of subagents that the agent is allowed to invoke; omitted on leaf agents)
+- Body: start with `You are ...`, then the sections the role needs: Mission or Scope,
+  Rules or Operating, the domain procedure, then Report or Output.
+- State scope boundaries with a named destination: "X goes to `executor`". When agent A routes to B,
+  B's scope description must accept that work.
+- Keep definitions self-contained: behaviour an agent or skill needs is stated in the pack's own
+  files, never delegated to external repositories.
+- Agents that report upward use a bounded report with explicit size caps.
+- Prefer a skill over an agent when the component is a procedure or domain knowledge rather than a
+  role with its own model or context needs.
 
-## Size and Line Budgets
+## Skill Files
 
-Keep non-fenced, non-table `.md` prose lines `<= 100` characters under `pack/`.
-Keep skill `SKILL.md` files `<= 300` lines, `<= 1380` body words (`residue` `<= 350`),
-and strictly under `24,000` bytes.
-Keep agent body word counts within tier caps: Main `1000`, Lead `700`, Review `600`,
-Worker `400`, Memory `400`, Quick `350`.
+- `skills/<name>/SKILL.md` with `name` equal to the directory name. Spend effort on the
+  `description`, which triggers loading: say what it does and when to use it.
+- Never use banned skill keys (`user-invocable`, `context`, `argument-hint`). Use
+  `disable-model-invocation: true` for skills that should not be triggered autonomously.
+- Keep SKILL.md under 300 lines and 1380 body words (linted). Put bulky references in
+  references/ and helpers in scripts/, referencing them via relative paths.
+
+## Reviewing Definitions (for critic)
+
+Judge a definition by its likely operational effect, not its tidiness:
+- Will the routing description trigger at the right times?
+- Can the agent do its job with the tools it has?
+- Are its boundaries reciprocal with its neighbors?
+- Are its contracts checkable?
+- Does it duplicate rules that live in a preloaded skill?
+- Is it self-contained, or does behaviour depend on unavailable files?
+
+## After Changing The Pack
+
+When an agent's name, scope, model, or tools change, run:
+- `/usr/bin/python3 -m unittest discover -s tests -t . -v`
+- `agy plugin validate --strict --json pack`
+- Bump `VERSION` (X.y format) and add an entry at the top of `CHANGELOG.md`.

@@ -1,25 +1,29 @@
 ---
 name: close-out
-description: Cleanly wrap up a session by verifying work, updating .supervisor/ memory via curator, and confirming git state.
+description: Close out the session's work by tearing down residue, archiving finished plans and artifacts into the store, committing it, and reporting session state. Use when finishing a milestone, plan, or session.
 disable-model-invocation: true
 ---
 
-# Session Close-Out Checklist
+# Close out
 
-Run this workflow when wrapping up a working session so the next session starts cleanly.
+If a plan is still open (packages not `done`, or `## Todo` not complete), print the `Session state:`
+line as `not safe to /clear` with the reason, and stop. Otherwise run these steps in order.
 
-## Steps
+1. Brief `fixer` `teardown`; `teardown retry` when the request specifies retry.
+2. Brief `curator` `close-out <path>` per finished plan or working artifact, `record` for a bare
+   decision. Add `task <card>` when the finished work has a card with an empty `plan:`
+   (research-only, executor-only or quick-tier work); with no artifact, brief
+   `close-out task <card>`. In a one-off (no store), `curator` first creates the store
+   (`make this a project`); inside git, ask the user once: tracked or local.
+3. Brief `git-ops` `chore(memory): ...` for the staged paths `curator` and `fixer` report.
+4. If anything remains for the user, end with one block headed `Run yourself:`: shell commands
+   verbatim in a fenced block (copy a failed teardown entry's `remove` command from `fixer`'s
+   report), manual steps one line each.
+5. Print the last line, from what the agents reported:
 
-1. **Sweep residue**: ensure temporary scratch files, debug logs, and dead edits are removed
-   from modified files (`residue` checklist).
-2. **Verify changed work**: ensure all relevant tests and linters ran after the final edit,
-   recording exact commands and pass counts. Never mark unverified work as tested.
-3. **Update `.supervisor/` memory**: invoke `curator` (never directly committing) to:
-   - Append a concise verified entry to `.supervisor/history.md`
-   - Refresh `.supervisor/roadmap.md` with completed items, active blockers, and next step
-   - Record any new architectural decisions under `.supervisor/memory/decisions/`
-4. **Inspect git state**: invoke `git-ops` (or inspect `git status --short` and worktrees) to
-   confirm no dangling `.agents/worktrees/*` remain unless intentionally kept open, and ask
-   the user before creating commits if uncommitted changes remain.
-5. **Emit close-out footers**: end with clear `Session state:` and `Run yourself:` lines
-   summarizing branch, clean/dirty state, test status, and the exact next pickup command.
+```
+Session state: <closed out | wave N booked>; residue <removed | N failed>; store <committed | uncommitted | not stored>; safe to /clear, resume with "<prompt>"
+```
+
+or `Session state: <state>; not safe to /clear: <why>`. The resume prompt is `/pick-up <plan path>`
+when a plan is live, else the next task.

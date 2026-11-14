@@ -28,6 +28,16 @@ class VersionTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), f"agy-supervisor {version}")
 
+        changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        match = re.search(r"^##\s+(\d+\.\d+)\s+-\s+(\d{4}-\d{2}-\d{2})\b", changelog, re.MULTILINE)
+        self.assertIsNotNone(match, "CHANGELOG.md missing top ## X.y - YYYY-MM-DD heading")
+        top_version = match.group(1)
+        self.assertEqual(
+            top_version,
+            version,
+            f"top changelog version {top_version} does not match VERSION {version}",
+        )
+
     def test_version_bumped_when_pack_or_deploy_changed(self) -> None:
         git_dir = REPO_ROOT / ".git"
         if not git_dir.exists():

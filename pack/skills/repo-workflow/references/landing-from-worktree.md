@@ -1,36 +1,22 @@
-# Landing Changes from a Git Worktree
+# Landing From A Worktree
 
-Use this procedure when `executor` implements work inside `<toplevel>/.agents/worktrees/<slug>`.
+Use this when no checkout has the default branch, or the harness confines the session to the
+worktree and refuses commands against the parent checkout. Run everything in the worktree.
 
-## Creating the Worktree
-
-1. Resolve repo root: `TOP=$(git rev-parse --show-toplevel)`.
-2. Ensure local exclude exists:
-   Check `.git/info/exclude` contains `.agents/worktrees/` and append if missing.
-3. Create branch + worktree cleanly:
-   `git worktree add "$TOP/.agents/worktrees/<slug>" -b "work/<slug>"`
-
-## Running Inside the Worktree
-
-- Run all edits, builds, unit tests, critic reviews, and `residue` sweeps inside
-  `$TOP/.agents/worktrees/<slug>`.
-- Commit clean logical commits on `work/<slug>` inside the worktree if needed before
-  landing back to the primary checkout.
-
-## Local Landing (No Unrequested Pushes)
-
-1. Confirm primary checkout (`$TOP`) is on the target branch and free of conflicting dirty
-   edits on overlapping files (`git -C "$TOP" status --short`).
-2. Review full diff against target branch:
-   `git diff <base>..work/<slug>` and run targeted tests.
-3. Squash-merge locally into the primary checkout:
-   ```bash
-   git -C "$TOP" merge --squash "work/<slug>"
-   git -C "$TOP" commit -m "<concise summary>" \
-     -m "Co-Authored-By: Supervisor for Antigravity"
-   ```
-   Ask the user before committing if they prefer reviewing unstaged or staged changes first.
-4. Re-run the verification test command in `$TOP` after landing.
-5. Remove worktree and delete temporary branch:
-   `git -C "$TOP" worktree remove "$TOP/.agents/worktrees/<slug>"`
-   `git -C "$TOP" branch -D "work/<slug>"`
+1. `git fetch origin`, then `git rebase origin/<default> <branch>` (step 2 of Landing A Work
+   Branch) and rerun the checks.
+2. `git checkout --detach origin/<default>`, then `git merge --squash <branch>`, then
+   `git add .supervisor` for a tracked store.
+3. Bump `VERSION` in an `X.y` repo when the change set touches a versioned path (`SKILL.md`, The
+   X.y Scheme), and run the checks.
+4. Apply the step-4 guard unchanged: commit only once
+   `git diff --cached --quiet <branch> -- . ':!VERSION'` (with `':!.supervisor'` as step 4 says)
+   confirms the staged tree is the branch. Commit with the `git-safety` trailer
+   (`Co-Authored-By: Supervisor for Antigravity`).
+5. Push only when the brief carries `Confined to worktree: <path>; push to <default> authorized`.
+   Without it, stop here and report the squash SHA.
+6. `git push origin HEAD:<default>`, fast-forward only, never `--force`. If origin rejects, fetch,
+   redo from step 1 once, then stay detached, report the squash SHA and stop. Push other remotes
+   after origin in the same step (Sync With Origin).
+7. `git checkout <branch>`. Report the squash SHA, that the parent checkout needs
+   `git pull --ff-only`, and that the worktree was not removed.

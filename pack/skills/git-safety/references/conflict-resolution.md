@@ -1,20 +1,28 @@
-# Git Conflict Resolution Guide
+# Resolving Conflicts
 
-Use this procedure when merging a feature/worktree branch or hitting merge conflicts.
+Use this only when `git status` shows unmerged paths. Do not start merges, rebases, or cherry-picks
+yourself.
 
-## Safe Recovery Steps
+1. Note the operation in progress from `git status`.
+2. Read each file's `<<<<<<<` / `=======` / `>>>>>>>` regions, and the intent of both sides, using
+   `git log` on each side when that helps.
+3. Combine changes that do not overlap. Where both sides change the same thing, pick the side that
+   matches the intended outcome.
+4. If the intent is ambiguous or needs domain knowledge, stop and present both sides with a
+   recommendation. If the conflict is deeper than the triage in your brief (overlapping logic edits,
+   many files, or unclear intent on either side), stop and report Outcome `blocked` with a summary
+   starting `ESCALATE: conflict deeper than triaged`, plus what you found.
+5. Remove all markers. Validate structured files (JSON, YAML, TOML) and run the relevant tests.
+6. Stage only the resolved files. Never edit files that are not in conflict, or anything under
+   `.git/`.
+7. Continue with `git merge --continue`, `git rebase --continue`, or `git cherry-pick --continue`.
+8. Run `git status` to confirm the final state. If the user asks to abort, use the matching
+   `--abort`.
 
-1. **Check status and abort threshold**:
-   - Run `git status --short` to list conflicted paths (`UU`, `AA`, `DU`, `UD`).
-   - If you are unsure of the intended semantics for business logic or user-edited files,
-     stop immediately (or run `git merge --abort`) and ask the lead/supervisor.
-2. **Inspect both sides cleanly**:
-   - Run `git diff --merge` or inspect `<<<<<<< HEAD` / `=======` / `>>>>>>> <branch>` hunks
-     directly with `read_file`.
-   - Understand what changed on base (`HEAD`) versus incoming branch before editing.
-3. **Resolve and remove markers**:
-   - Edit each conflicted file so zero conflict markers remain.
-   - Verify with `grep -rn '<<<<<<<\|=======\|>>>>>>>' <paths>` or `git diff --check`.
-4. **Re-run verification after resolution**:
-   - Conflict merges can compile while breaking invariants; run the targeted test suite
-     before finishing the merge commit or squash landing.
+Store conflicts (`.supervisor/`): `history.md` and a plan's `## Log` keep both sides' lines. Other
+store files combine per step 3. One entry changed differently on both sides keeps the
+default-branch text, and the report names the branch text with `follow-up: curator`. Never drop an
+entry file.
+
+Report each conflicted file and how it was resolved (kept, combined, or discarded). Never silently
+drop changes.

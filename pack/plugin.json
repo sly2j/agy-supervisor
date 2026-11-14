@@ -1,7 +1,7 @@
 {
   "name": "agy-supervisor",
   "displayName": "Supervisor for Antigravity",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Multi-agent supervisor orchestration pack for Antigravity: hierarchical supervisor, domain leads, workers, independent critics, git worktree isolation, and persistent .supervisor/ project memory.",
   "logo": "assets/logo.svg",
   "author": "sjoosten",

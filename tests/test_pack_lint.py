@@ -1,10 +1,13 @@
 """Lint tests enforcing Supervisor for Antigravity pack invariants."""
 
+import ast
 import json
 import os
+import py_compile
 import re
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -300,6 +303,184 @@ class PackLintTest(unittest.TestCase):
         self.assertEqual(data["findings"], [])
         self.assertEqual(data["components"]["agents"], 15)
         self.assertEqual(data["components"]["skills"], 17)
+
+    def test_agent_exact_models(self) -> None:
+        """1. Exact per-agent model map."""
+        expected_models = {
+            "supervisor": "inherit",
+            "writer": "inherit",
+            "planner": "pro",
+            "researcher": "pro",
+            "executor": "pro",
+            "critic": "pro",
+            "scope-critic": "pro",
+            "writer-worker": "pro",
+            "curator": "flash",
+            "planner-worker": "flash",
+            "researcher-worker": "flash",
+            "executor-worker": "flash",
+            "scout": "flash_lite",
+            "git-ops": "flash_lite",
+            "fixer": "flash_lite",
+        }
+        for name, expected_model in expected_models.items():
+            path = AGENTS_DIR / f"{name}.md"
+            meta, _ = parse_frontmatter(path)
+            self.assertEqual(
+                meta.get("model"),
+                expected_model,
+                f"{name}: expected model {expected_model!r}, got {meta.get('model')!r}",
+            )
+
+    def test_agent_models_match_tiers_table(self) -> None:
+        """2. Alignment between pack/agents/*.md models and Tiers table in agent-authoring/SKILL.md."""
+        authoring_text = (SKILLS_DIR / "agent-authoring" / "SKILL.md").read_text(encoding="utf-8")
+        section = authoring_text.split("## Tiers", 1)[1].split("\n## ", 1)[0]
+        table_rows = [l for l in section.splitlines() if l.startswith("|")][2:]
+        tiers_table_models: Dict[str, str] = {}
+        for row in table_rows:
+            parts = [c.strip() for c in row.strip("|").split("|")]
+            agents_cell = parts[1]
+            model_effort_cell = parts[2]
+            model = model_effort_cell.split("/")[0].strip().split()[0]
+            for agent_name in agents_cell.split(","):
+                tiers_table_models[agent_name.strip()] = model
+
+        for name in EXPECTED_AGENTS:
+            self.assertIn(name, tiers_table_models, f"{name} missing from Tiers table in agent-authoring")
+            meta, _ = parse_frontmatter(AGENTS_DIR / f"{name}.md")
+            self.assertEqual(
+                meta.get("model"),
+                tiers_table_models[name],
+                f"{name} frontmatter model {meta.get('model')} != Tiers table {tiers_table_models[name]}",
+            )
+
+    def test_project_memory_template_invariants(self) -> None:
+        """3. v10 project-memory template invariants."""
+        templates_dir = SKILLS_DIR / "project-memory" / "templates"
+        entry_meta, _ = parse_frontmatter(templates_dir / "entry.md")
+        self.assertEqual(
+            set(entry_meta.keys()),
+            {"domain", "summary", "affects", "verified", "source", "supersedes"},
+        )
+
+        draft_meta, _ = parse_frontmatter(templates_dir / "draft-state.md")
+        self.assertEqual(set(draft_meta.keys()), {"file"})
+
+        task_meta, _ = parse_frontmatter(templates_dir / "task.md")
+        self.assertEqual(
+            set(task_meta.keys()),
+            {"summary", "status", "owner", "since", "plan", "depends", "decisions"},
+        )
+
+        store_readme = templates_dir / "store-readme.md"
+        self.assertTrue(store_readme.is_file())
+        self.assertFalse(
+            store_readme.read_text(encoding="utf-8").startswith("---"),
+            "store-readme.md must not contain YAML frontmatter",
+        )
+
+        tasks_ref = SKILLS_DIR / "project-memory" / "references" / "tasks.md"
+        self.assertTrue(tasks_ref.is_file(), "references/tasks.md must exist")
+
+    def test_curator_task_operations_in_scope(self) -> None:
+        """4. curator.md explicitly covers task and drop task operations."""
+        curator_text = (AGENTS_DIR / "curator.md").read_text(encoding="utf-8")
+        scope = curator_text.split("## Scope", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("task <text>", scope)
+        self.assertIn("drop task <card>", scope)
+
+    def test_memory_agents_prohibit_committing(self) -> None:
+        """5. curator.md and fixer.md both prohibit committing (Never run + git commit)."""
+        for name in ("curator", "fixer"):
+            text = (AGENTS_DIR / f"{name}.md").read_text(encoding="utf-8")
+            self.assertIn("Never run", text, f"{name} must contain 'Never run'")
+            self.assertIn("git commit", text, f"{name} must contain 'git commit'")
+
+    def test_git_ops_loads_safety_and_workflow_skills(self) -> None:
+        """6. git-ops.md references git-safety and repo-workflow."""
+        meta, _ = parse_frontmatter(AGENTS_DIR / "git-ops.md")
+        skills = set(meta.get("skills", []))
+        self.assertTrue(
+            {"git-safety", "repo-workflow"} <= skills,
+            f"git-ops must load git-safety and repo-workflow, got {skills}",
+        )
+
+    def test_origin_rebase_and_landing_rules(self) -> None:
+        """7. Origin rebase / upstream landing rule present in repo-workflow and git-ops.md."""
+        repo_wf = (SKILLS_DIR / "repo-workflow" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("git fetch origin", repo_wf)
+        self.assertIn("pull --rebase", repo_wf)
+        self.assertIn("`origin` first", repo_wf)
+
+        git_ops = (AGENTS_DIR / "git-ops.md").read_text(encoding="utf-8")
+        self.assertIn("git fetch origin", git_ops)
+        self.assertIn("pull --rebase", git_ops)
+        self.assertIn("`origin` first", git_ops)
+
+    def test_attribution_conventions(self) -> None:
+        """8. Attribution invariant: supervisor.md and git-ops.md require Co-Authored-By and reject harness reminders."""
+        for name in ("supervisor", "git-ops"):
+            text = " ".join((AGENTS_DIR / f"{name}.md").read_text(encoding="utf-8").split())
+            self.assertIn("Co-Authored-By: Supervisor for Antigravity", text, f"{name} attribution trailer missing")
+            self.assertIn("harness attribution reminders", text, f"{name} generic harness reminder rejection missing")
+            self.assertNotIn("claude-session", text, f"{name} must not leak claude-session")
+
+    def test_residue_skill_preloaded(self) -> None:
+        """9. residue skill referenced in executor, executor-worker, researcher, researcher-worker, and fixer."""
+        for name in ("executor", "executor-worker", "researcher", "researcher-worker", "fixer"):
+            meta, _ = parse_frontmatter(AGENTS_DIR / f"{name}.md")
+            skills = meta.get("skills", [])
+            self.assertIn("residue", skills, f"{name} must list residue in skills")
+
+    def test_residue_teardown_wiring(self) -> None:
+        """10. Residue teardown wiring present in supervisor.md, close-out/SKILL.md, and fixer.md."""
+        for target in (
+            AGENTS_DIR / "supervisor.md",
+            AGENTS_DIR / "fixer.md",
+            SKILLS_DIR / "close-out" / "SKILL.md",
+        ):
+            text = target.read_text(encoding="utf-8")
+            self.assertIn("teardown", text, f"{target.name} must wire teardown")
+
+    def test_scripts_executable_and_syntax(self) -> None:
+        """11. All scripts exist, have executable bits where appropriate, and pass syntax compilation & AST checks."""
+        scripts = [
+            REPO_ROOT / "deploy",
+            SKILLS_DIR / "supervisor-config" / "scripts" / "external-critic",
+            SKILLS_DIR / "project-backup" / "scripts" / "backup.sh",
+            REPO_ROOT / "tools" / "audit" / "audit.py",
+        ]
+        for s in scripts:
+            self.assertTrue(s.is_file(), f"{s} does not exist")
+
+        for s in (
+            REPO_ROOT / "deploy",
+            SKILLS_DIR / "supervisor-config" / "scripts" / "external-critic",
+            SKILLS_DIR / "project-backup" / "scripts" / "backup.sh",
+        ):
+            self.assertTrue(bool(s.stat().st_mode & 0o111), f"{s} is not executable")
+
+        with tempfile.TemporaryDirectory() as td:
+            for py_s in (
+                REPO_ROOT / "deploy",
+                SKILLS_DIR / "supervisor-config" / "scripts" / "external-critic",
+                REPO_ROOT / "tools" / "audit" / "audit.py",
+            ):
+                cfile = Path(td) / f"{py_s.name}.pyc"
+                py_compile.compile(str(py_s), cfile=str(cfile), doraise=True)
+                tree = ast.parse(py_s.read_text(encoding="utf-8"), filename=str(py_s))
+                for node in ast.walk(tree):
+                    if hasattr(ast, "Match") and isinstance(node, ast.Match):
+                        self.fail(f"{py_s} contains ast.Match which requires Python 3.10+")
+
+        proc = subprocess.run(
+            ["bash", "-n", str(SKILLS_DIR / "project-backup" / "scripts" / "backup.sh")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, f"backup.sh syntax error: {proc.stderr}")
 
 
 if __name__ == "__main__":
