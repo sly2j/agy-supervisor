@@ -1,132 +1,166 @@
-# Project Memory & Externalized Stores (`.supervisor/`)
+# Keeping Memory Outside The Repo
 
-A project's persistent memory lives under `.supervisor/` and in optional local rules
-(`GEMINI.local.md`). `agy-supervisor` provides a structured, multi-horizon memory architecture
-designed for long-running software engineering and scientific research.
+A project's memory lives in `.supervisor/` and `GEMINI.local.md`. In a repo you
+cannot commit them to (open source, a shared team repo, a repo you do not own)
+they sit as local files in one checkout: invisible to git, gone with the clone,
+and not shared with your linked worktrees or your other machines.
+`agy-supervisor memory` moves them into a directory outside the repo and leaves
+two symlinks behind, so the store is the same live store everywhere it is
+linked, and you can put that directory under version control and sync it
+yourself.
 
-## The v10 Memory Architecture
+When you choose a local store, the answer ends with a hint to run
+`agy-supervisor memory externalize`. The three examples below cover the three
+cases: moving the store out once, using it from a linked worktree, and using it
+on another machine. They assume a project checked out at `/home/you/src/proj` and
+the default external root.
 
-The memory store organizes project context into three distinct time horizons:
+## Example 1: Move The Store Out Of The Repo
 
-```text
-.supervisor/
-├── README.md             # Store guide (derived from store-readme template)
-├── history.md            # Append-only milestone log of finished tasks
-├── tasks/                # Mid-term horizon: active and open task cards
-│   └── YYYY-MM-DD-<slug>.md
-├── memory/               # In-force long-term knowledge entries
-│   ├── decisions/        # Architectural Decision Records (ADRs)
-│   ├── facts/            # Verified technical parameters and invariants
-│   ├── lessons/          # Approved post-mortem findings and patterns
-│   ├── goals/            # High-level project objectives and constraints
-│   └── conventions/      # Style rules, lint guidelines, and conventions
-├── working/              # Short-term horizon: active working documents
-│   ├── plans/            # Active implementation and program plans
-│   ├── research/         # Active investigation and code-trace notes
-│   ├── writing/          # In-progress drafts and draft-state manifests
-│   └── residue/          # Ledger of temporary test/build artifacts
-└── archive/              # Immutable historical record (mirrors live tree)
-    ├── tasks/            # Completed and dropped task cards
-    ├── memory/           # Superseded ADRs, retired facts, and conventions
-    └── working/          # Completed plans and historical research notes
-```
-
-### Memory Horizons
-1. **Short-Term (`working/`)**: In-progress plans, research briefs, and drafts. Read and updated
-   by domain leads during active tasks. Finished artifacts are moved to `archive/working/` at
-   close-out.
-2. **Mid-Term (`tasks/`)**: Self-contained task cards (`templates/task.md`) holding status,
-   ownership, dependencies, and acceptance criteria.
-3. **Long-Term (`memory/`)**: In-force entries (`templates/entry.md`) with 6 standard frontmatter
-   keys (`domain`, `summary`, `affects`, `verified`, `source`, `supersedes`) and concise bodies
-   under 150 words (`The choice... Why: ... Rejected: ...`).
-
-## Storage Models: Tracked, Local, or Externalized
-
-When a repository initializes `.supervisor/`, the user chooses how memory is stored:
-
-| Storage Model | Mechanics | Use Case |
-|---|---|---|
-| **Tracked Store** | Committed into repository git history | Private repos, team shared projects |
-| **Local Store** | Excluded via `.git/info/exclude` | Open source or shared upstream repos |
-| **Externalized Store** | Out-of-tree store symlinked back | Shared across worktrees & machines |
-
-## Externalized Memory (`./deploy memory`)
-
-In repos where memory cannot be committed, `agy-supervisor memory externalize` moves `.supervisor/`
-and `GEMINI.local.md` outside the repository to an XDG-compliant data directory, replacing them
-with absolute symlinks:
+Run this once, in the project's main checkout:
 
 ```bash
-# Externalize project memory
+cd /home/you/src/proj
 agy-supervisor memory externalize
+```
 
-# Link a git worktree to the external memory store
+```text
+move /home/you/src/proj/.supervisor -> /home/you/.local/share/agy-supervisor/memory/proj/.supervisor
+link /home/you/src/proj/.supervisor -> /home/you/.local/share/agy-supervisor/memory/proj/.supervisor
+create /home/you/.local/share/agy-supervisor/memory/proj/GEMINI.local.md
+link /home/you/src/proj/GEMINI.local.md -> /home/you/.local/share/agy-supervisor/memory/proj/GEMINI.local.md
+excluded: .supervisor, GEMINI.local.md in /home/you/src/proj/.git/info/exclude
+externalized: /home/you/.local/share/agy-supervisor/memory/proj
+```
+
+A `move` line means the project had that item; a `create` line means it had none
+and the tool made an empty one. The project now holds two symlinks, and git
+ignores them. The memory itself is in
+`~/.local/share/agy-supervisor/memory/proj/`.
+
+To give the memory its own history, make that directory a repo:
+
+```bash
+cd ~/.local/share/agy-supervisor/memory && git init    # one repo for all projects
+# or: cd ~/.local/share/agy-supervisor/memory/proj && git init    # one repo per project
+```
+
+The project name comes from the origin URL, else the folder name. Pass `--name`
+to choose another, and `--root` to use another external root:
+
+```bash
+agy-supervisor memory externalize --name proj --root ~/memory
+```
+
+## Example 2: Use It From A Linked Worktree
+
+Worktrees the pack creates get the two links automatically. For a worktree you
+made yourself, run `link` inside it:
+
+```bash
+git worktree add ../proj-feature
+cd ../proj-feature
 agy-supervisor memory link
-
-# Check health of memory symlinks and exclude rules
-agy-supervisor memory status
 ```
 
-### Default External Root
-- Stores live at `$AGY_SUPERVISOR_MEMORY_ROOT/<project-name>/` (default:
-  `~/.local/share/agy-supervisor/memory/<project-name>/`).
-- A `README.md` marked with `<!-- agy-supervisor external memory -->` is placed in the store root
-  to identify ownership.
-
-### Safety Invariants
-1. **Refusal on Tracked Files**: Refuses to externalize if `.supervisor` or `GEMINI.local.md` is
-   tracked by git. Untrack with `git rm -r --cached .supervisor` before externalizing.
-2. **Path Containment Guard**: Refuses if the store target sits inside the repository or any of
-   its worktrees.
-3. **Clean `.git/info/exclude`**: Rules are added to `.git/info/exclude`, leaving `.gitignore`
-   completely untouched.
-4. **Foreign Store Protection**: Rejects linking to an existing directory unless it contains the
-   matching supervisor marker and project name.
-
-## Antigravity Workspace Permissions Grant
-
-Because externalized memory sits outside the project directory, Antigravity requires explicit
-file access grants. `deploy install` and `deploy memory externalize` configure
-`~/.gemini/antigravity-cli/settings.json` automatically:
-
-```json
-{
-  "permissions": {
-    "additionalDirectories": [
-      "/Users/<you>/.local/share/agy-supervisor/memory"
-    ],
-    "allow": [
-      "Edit(/Users/<you>/.local/share/agy-supervisor/memory/**)"
-    ]
-  }
-}
+```text
+link /home/you/src/proj-feature/.supervisor -> /home/you/.local/share/agy-supervisor/memory/proj/.supervisor
+link /home/you/src/proj-feature/GEMINI.local.md -> /home/you/.local/share/agy-supervisor/memory/proj/GEMINI.local.md
+linked: /home/you/.local/share/agy-supervisor/memory/proj
 ```
 
-This prevents interactive confirmation prompts whenever agents read, create, or modify memory
-entries through the symlinks.
+All worktrees share the one external store, so what an agent records in a
+worktree is there from the main checkout too. The exclude file is shared by the
+worktrees, so no new lines are needed.
 
-## Migrating Legacy `roadmap.md`
+## Example 3: Use It On Another Machine
 
-Earlier releases tracked project milestones in a monolithic `.supervisor/roadmap.md`. In v1.1,
-monolithic roadmaps are replaced by atomic task cards:
+Clone the memory repo and the project, then link:
 
-1. **Card Extraction**: Split active milestones into individual cards under `.supervisor/tasks/`:
-   ```yaml
-   ---
-   summary: Implement feature X with unit tests
-   status: open
-   owner:
-   since: 2026-11-14
-   plan:
-   depends: []
-   decisions: []
-   ---
-   Goal: Deliver feature X.
-   Scope: Target files and interfaces.
-   Done when: Unit tests pass.
-   Notes: Relevant context.
-   ```
-2. **Retire Legacy File**: Move `roadmap.md` into `archive/working/plans/roadmap.md`.
-3. **Update Curators & Skills**: Dispatches to `curator` maintain cards using `task` and
-   `drop task` procedures.
+```bash
+git clone <memory repo> ~/.local/share/agy-supervisor/memory
+git clone <project repo> ~/src/proj && cd ~/src/proj
+agy-supervisor memory link
+```
+
+```text
+link /home/you/src/proj/.supervisor -> /home/you/.local/share/agy-supervisor/memory/proj/.supervisor
+link /home/you/src/proj/GEMINI.local.md -> /home/you/.local/share/agy-supervisor/memory/proj/GEMINI.local.md
+excluded: .supervisor, GEMINI.local.md in /home/you/src/proj/.git/info/exclude
+linked: /home/you/.local/share/agy-supervisor/memory/proj
+```
+
+If you cloned the memory repo somewhere else, or the project's name differs,
+pass `--root DIR`, `--name N`, or the project's memory directory itself:
+`agy-supervisor memory link ~/memory/proj`.
+
+## What `externalize` Does
+
+The symlinks are absolute, and Google Antigravity reads `GEMINI.local.md`
+through its link as before. The exclude lines go in `.git/info/exclude`; the
+project's `.gitignore` is never touched. The `README.md` in `<root>/<name>/`
+says which project the directory belongs to and how to move it back. The
+`.gitignore` there keeps test leftovers (the residue ledger, see
+[workflow-lifecycle.md](workflow-lifecycle.md)) out of the memory history.
+
+The external root is `$AGY_SUPERVISOR_MEMORY_ROOT`, else
+`${XDG_DATA_HOME:-~/.local/share}/agy-supervisor/memory`; `--root` overrides
+both. It is data, not config, so it survives `agy-supervisor uninstall`.
+
+Google Antigravity treats the store as outside the project, because the links
+point out of it. `install` and `externalize` therefore add the root to
+`permissions.additionalDirectories` and `Edit(//<root>/**)` to
+`permissions.allow` in `~/.gemini/antigravity-cli/settings.json`, skipping what
+is already there. A store externalized under a custom root before this existed
+needs `externalize` run again in its project, or the two entries added by hand.
+
+`externalize` and `link` are safe to repeat: a second run only repairs what is
+missing. When either refuses, its message names the repair.
+
+Installs without a launcher can run `./deploy memory <verb>` from a checkout.
+Windows is not supported.
+
+## Daily Flow
+
+Nothing changes. Agents read and write `.supervisor/` as before; the files land
+in the external directory. Once that directory is a repo, the pack commits memory
+changes there at close-out and after each wave of a large plan, as
+`chore(memory): ...` commits. It never pushes or pulls: add a remote and push
+when you choose.
+
+## Status And Troubleshooting
+
+`agy-supervisor memory status` is a read-only check of the links and exclude
+lines. It exits 1 when something is off, and each message names its repair.
+
+- **Dangling link:** the external directory moved or is missing (a fresh machine
+  without the clone). Restore it, or remove the link and run `memory link`.
+- **Missing exclude line:** rerun `externalize` or `link`; it adds the line.
+- **Tracked store:** git tracks `.supervisor` or `GEMINI.local.md`. Untrack with
+  `git rm -r --cached`, commit, then rerun.
+- **Both exist:** the project has a real store and `<root>/<name>` has one too.
+  Either a move was interrupted, or another project with the same default name
+  already uses `<root>/<name>`. Look at `<root>/<name>/README.md`, which names
+  the project it belongs to, before removing anything. For a name clash, keep
+  both and re-run with `--name`.
+- **Same-name projects:** two projects whose default names match share
+  `<root>/<name>`. If the second project has a store, `externalize` stops with
+  `both exist`. If it has none, `externalize` stops with a hint to run `memory
+  link`; do not follow it, since that would attach this project to the other
+  one's memory. In both cases re-run with `--name`.
+
+## Moving Back
+
+```bash
+rm .supervisor GEMINI.local.md                      # the two symlinks
+mv <root>/<name>/.supervisor <root>/<name>/GEMINI.local.md .
+```
+
+The exclude lines can stay; they keep the restored local store out of git.
+
+## Sharing With A Team
+
+The external directory is an ordinary git repo, so a team can share one memory
+repo and each member links their checkout to a clone of it. Nothing merges the
+store for you: agents write to it freely, so agree on who pushes and pull before
+starting.
