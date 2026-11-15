@@ -2,7 +2,7 @@
 domain: code
 summary: adapt supervisor orchestration natively to google antigravity
 affects: [pack/, deploy, pack/skills/supervisor-config/scripts/external-critic]
-verified: 2026-11-13
+verified: 2026-11-15
 source: user 2026-11-13
 supersedes:
 ---

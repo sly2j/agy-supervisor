@@ -28,3 +28,5 @@ Append-only log of verified milestones.
   memory, model tiers, deploy operations, and context engineering.
 - Expanded stdlib unittest suite to 78 passing tests, adding 11 pack-lint invariant checks and 28
   canonical routing scenarios with deterministic contract validation and opt-in live execution.
+
+- 2026-11-15 6576060 align docs with upstream baseline; goals: none; plan: none; decisions: .supervisor/memory/conventions/2026-11-15-align-docs-with-upstream-baseline.md
