@@ -1,7 +1,9 @@
 # Supervisor for Antigravity
 
-Supervisor for Antigravity is a multi-agent orchestration layer for Google Antigravity (agy CLI
-and Antigravity IDE). It is centered around a single supervisor agent that dispatches tasks based
+Supervisor for Antigravity is a multi-agent orchestration layer for Google
+Antigravity (agy CLI and Antigravity IDE). It is a port of
+[Supervisor for Claude](https://github.com/sly2j/claude-supervisor). It is
+centered around a single supervisor agent that dispatches tasks based
 on scope and complexity. The supervisor answers simple questions itself, sends small exact tasks
 to a fast, cheap agent, and gives larger work to a lead agent. The lead splits the work across
 parallel workers when it has several independent parts, otherwise does it itself, and has critic
